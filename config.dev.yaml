@@ -1,0 +1,35 @@
+audio:
+  alsa_card: 2
+  alsa_device: 0
+  sample_rate: 48000
+  channels: 2
+  format: "S24_3LE"
+  target_rate: 16000
+  target_channels: 1
+  chunk_ms: 100
+
+wakeword:
+  model_path: "/opt/five/models/five.rpw"
+  threshold: 0.5
+
+transcription:
+  model_path: "models/ggml-base.en.bin"
+  command_duration_sec: 10
+  sample_rate: 16000
+
+openclaw:
+  endpoint: "http://localhost:8080/api/v1/command"
+  timeout_sec: 30
+
+ambient:
+  enabled: false
+  interval_min: 15
+  duration_sec: 30
+  log_dir: "/tmp/five/ambient"
+  max_files: 100
+
+logging:
+  level: "info"
+  log_dir: "/tmp/five"
+  max_size_mb: 10
+  max_files: 5
