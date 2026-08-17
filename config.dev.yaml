@@ -18,8 +18,11 @@ transcription:
   sample_rate: 16000
 
 openclaw:
-  endpoint: "http://localhost:8080/api/v1/command"
+  endpoint: "http://127.0.0.1:10000"
   timeout_sec: 30
+  password: "changeme"
+  from_agent: "five"
+  to_agent: "five"
 
 ambient:
   enabled: false

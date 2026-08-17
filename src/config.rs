@@ -60,10 +60,17 @@ pub struct TranscriptionConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OpenClawConfig {
-    /// HTTP endpoint to POST transcribed commands
+    /// Orchestrator base URL (e.g. "http://127.0.0.1:10000")
     pub endpoint: String,
     /// Request timeout in seconds
     pub timeout_sec: u64,
+    /// Orchestrator admin password (exchanged for a JWT at startup)
+    pub password: String,
+    /// Sender agent ID or name — Five's identity in Orchestre.
+    /// Must exist and be Running (orchestrator requirement).
+    pub from_agent: String,
+    /// Recipient agent ID or name — the agent voice commands go to
+    pub to_agent: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

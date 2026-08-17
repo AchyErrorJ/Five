@@ -1,5 +1,6 @@
 mod audio;
 mod config;
+mod openclaw;
 mod transcribe;
 mod voice;
 
@@ -60,17 +61,25 @@ fn load_config(path: &std::path::Path) -> anyhow::Result<AppConfig> {
         .with_context(|| format!("failed to load config from {}", path.display()))
 }
 
-/// Live pipeline test with a keyboard stub for the wake word: press Enter to
-/// trigger, speak a command, get a transcription back. Exercises the real
-/// capture → transcribe path without a rustpotter model. NOTE: recording
-/// starts at the trigger, so the first ~word of a real command would be cut;
-/// wakeword.rs will add a pre-trigger ring buffer.
-fn listen_loop(config: &AppConfig) -> anyhow::Result<()> {
+/// Full assistant loop with a keyboard stub for the wake word: press Enter to
+/// trigger, speak a command, get it transcribed, dispatched to Orchestre, and
+/// the reply spoken back. NOTE: recording starts at the trigger, so the first
+/// ~word of a real command would be cut; wakeword.rs will add a pre-trigger
+/// ring buffer.
+fn listen_loop(config: AppConfig) -> anyhow::Result<()> {
     use std::io::BufRead;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
+    // Single-threaded runtime for the async pieces (HTTP, TTS synthesis).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build listen runtime")?;
+
     let transcriber = transcribe::Transcriber::load(&config.transcription)?;
+    let speaker = rt.block_on(voice::Speaker::load(&config.voice))?;
+    let client = openclaw::OrchestreClient::new(&config.openclaw)?;
     let capture = audio::AudioCapture::start(&config.audio)?;
 
     // Enter key → trigger flag (stdin blocks, so it gets its own thread).
@@ -108,7 +117,20 @@ fn listen_loop(config: &AppConfig) -> anyhow::Result<()> {
                 collecting = None;
                 match transcriber.transcribe_to_string(&audio) {
                     Ok(text) if text.is_empty() => println!(">> (nothing recognized)"),
-                    Ok(text) => println!(">> {text}"),
+                    Ok(text) => {
+                        println!(">> {text}");
+                        match rt.block_on(client.send_command(&text)) {
+                            Ok(result) => {
+                                println!("<< [{}] {}", result.status, result.response.as_deref().unwrap_or("(no reply)"));
+                                if let Some(reply) = result.response {
+                                    if let Err(e) = rt.block_on(speaker.say(&reply)) {
+                                        tracing::error!("speech failed: {e:#}");
+                                    }
+                                }
+                            }
+                            Err(e) => tracing::error!("orchestrator dispatch failed: {e:#}"),
+                        }
+                    }
                     Err(e) => tracing::error!("transcription failed: {e:#}"),
                 }
                 tracing::info!("listening — press Enter to simulate the wake word");
@@ -146,7 +168,13 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Listen) => {
             let config = load_config(&cli.config)?;
             init_tracing(&config.logging.level);
-            listen_loop(&config)?;
+            // The listen loop is blocking (ALSA channel recv); run it on a
+            // dedicated thread with its own runtime for the async clients
+            // (Orchestre HTTP, Kokoro synth).
+            let handle = std::thread::spawn(move || listen_loop(config));
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("listen thread panicked"))??;
         }
         Some(Command::Speak { text }) => {
             let config = load_config(&cli.config)?;
