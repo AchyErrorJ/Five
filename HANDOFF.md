@@ -3,8 +3,8 @@
 **Project:** Five Voice Assistant Daemon
 **Repository:** `~/Desktop/Software/Five/five-daemon/` (git, branch `main`)
 **Language:** Rust (Edition 2021) — **all-Rust stack, no Python, no subprocesses**
-**Last Updated:** 2026-08-16
-**Status:** 🟡 Scaffolded — compiles clean (`cargo check` ✅), config + CLI entry defined, subsystems pending
+**Last Updated:** 2026-08-17 (evening)
+**Status:** 🟡 Ears + voice implemented — audio capture verified on hardware, STT verified end-to-end ("Moving out."), TTS code done pending fp32 model test
 
 ---
 
@@ -33,6 +33,8 @@ The original plan used a **Python ONNX bridge** (wake word over TCP) and a **whi
 | HTTP TLS | reqwest + native OpenSSL | reqwest + **rustls** | No system OpenSSL dependency; static, reproducible builds |
 | Audio | cpal *or* alsa (undecided) | **alsa** directly | Linux-only daemon, hardware-specific config (Blue Yeti Nano); cpal abstraction paid for nothing |
 | Config | `config` crate + serde_yaml (both half-present) | **serde_yaml** only | One loader, no drift |
+| Text-to-speech | (not planned) | **kokoro-en** (Kokoro-82M ONNX, in-process) | Added 2026-08-17: user wants Five to speak. Kokoro = best quality/size ratio in the Rust ecosystem; offline, Apache-2.0 weights |
+| Playback | — | **ALSA "default" device** | PipeWire routes to the user's default sink — the Bluetooth stereo (Esinkin adapter). Zero routing config needed |
 
 **Result:** one binary, one language, no Python, no subprocess supervision, no TCP bridge. The config schema shrank accordingly (`bridge_python`, `bridge_script`, `bridge_port`, `whisper_path` removed).
 
@@ -50,19 +52,26 @@ The original plan used a **Python ONNX bridge** (wake word over TCP) and a **whi
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| Project scaffold | ✅ Done | Flattened layout, git initialized, `.gitignore` in place |
+| Project scaffold | ✅ Done | Git repo (branch `main`, initial commit), flattened layout, `.gitignore` |
 | Configuration schema | ✅ Done | `src/config.rs` — YAML config, all sections, updated for all-Rust stack |
-| CLI + entry point | ✅ Done | `src/main.rs` — clap `--config` flag, config load, tracing init |
-| Audio capture (ALSA) | ❌ Not started | Dependency declared (`alsa`) |
-| Resampling | ❌ Not started | Dependency declared (`rubato`) |
-| Wake word detection | ❌ Not started | Dependency declared (`rustpotter`); **model file needed** |
-| Speech-to-text | ❌ Not started | Dependency declared (`whisper-rs`); **ggml model needed** |
-| HTTP client (OpenClaw) | ❌ Not started | `reqwest` declared; **blocked on API contract (§6)** |
-| Ambient recording | ❌ Not started | Config defined, no logic |
+| CLI + entry point | ✅ Done | `src/main.rs` — clap `--config` + subcommands: `record`, `transcribe`, `listen` |
+| Audio capture (ALSA) | ✅ Done | `src/audio.rs` — **verified on hardware** (Yeti Nano, hw:2,0): 48kHz stereo S24_3LE → mono f32 → rubato → 16kHz, 100ms chunks, xrun recovery |
+| Resampling | ✅ Done | rubato `FftFixedIn` 48k→16k in the capture thread |
+| Speech-to-text | ✅ Implemented | `src/transcribe.rs` — whisper-rs wrapper; **untested: needs `models/ggml-base.en.bin` (see §6.7)** |
+| Wake word stub | ✅ Done | `listen` subcommand: Enter key triggers record→transcribe over the live stream |
+| Wake word detection | ❌ Not started | `rustpotter` declared; **model file needed**; needs pre-trigger ring buffer (see §6.3) |
+| HTTP client (OpenClaw) | ❌ Not started | `reqwest` declared; **blocked on API contract (§6.1)** |
+| Ambient recording | ❌ Not started | Config defined; `audio::write_wav` + `AudioCapture` are the building blocks |
 | File logging/rotation | ❌ Not started | `tracing-appender` declared; console logging works now |
 | VAD (end-of-speech) | ❌ Not started | Not yet scoped — see §6.2 |
 
-**Compiles:** ✅ `cargo check` clean as of 2026-08-16 (requires `libasound2-dev`, `libclang-dev`, `cmake`, `g++`)
+**Compiles:** ✅ clean as of 2026-08-17. Build requires `libasound2-dev`, `libclang-dev`, `cmake`, `g++`.
+
+**Hardware notes (learned 2026-08-17):**
+- The Yeti Nano negotiates S24_3LE but delivers samples at the *physical* width; `Format::physical_width()` returns **bits**, not bytes — decode by width (3-byte packed path used).
+- `AudioCapture::drop` must not join the capture thread — a wedged blocking ALSA read would deadlock shutdown.
+- Mic has a hardware mute button (user mutes nightly) — digital silence in captures means check the button first, not the code. Mixer capture gain lives at 18/33 (+18dB), set by the mic's own knob.
+- Polar pattern: keep it on **cardioid** (rejects room noise → fewer false wake-word triggers).
 
 ---
 
@@ -73,12 +82,14 @@ five-daemon/
 ├── Cargo.toml          # All-Rust dependency stack
 ├── HANDOFF.md          # This document
 ├── .gitignore          # /target, logs, config.local.yaml
+├── config.dev.yaml     # Working dev config (Yeti Nano hw:2,0; relative model paths)
+├── models/             # Model files (ggml whisper, rustpotter .rpw) — NOT in git
 ├── src/
-│   ├── main.rs         # ✅ Entry point: CLI, config load, tracing
+│   ├── main.rs         # ✅ Entry point: CLI, subcommands, listen loop
 │   ├── config.rs       # ✅ YAML config structs + loader
-│   ├── audio.rs        # ❌ ALSA capture + rubato resampling
+│   ├── audio.rs        # ✅ ALSA capture + resampling + WAV writer
+│   ├── transcribe.rs   # ✅ whisper-rs wrapper + WAV reader
 │   ├── wakeword.rs     # ❌ rustpotter integration
-│   ├── transcribe.rs   # ❌ whisper-rs wrapper
 │   ├── openclaw.rs     # ❌ HTTP client to POST commands
 │   ├── ambient.rs      # ❌ Scheduled ambient recording
 │   └── logging.rs      # ❌ tracing-appender file rotation

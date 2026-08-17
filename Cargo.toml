@@ -51,6 +51,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Process management
 nix = { version = "0.27", features = ["process"] }
+kokoro-en = "0.1.5"
 
 [profile.release]
 opt-level = 3

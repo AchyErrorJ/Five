@@ -28,6 +28,12 @@ ambient:
   log_dir: "/tmp/five/ambient"
   max_files: 100
 
+voice:
+  model_path: "models/kokoro/model.onnx"
+  voices_dir: "voices"
+  voice: "af_heart"
+  speed: 1.0
+
 logging:
   level: "info"
   log_dir: "/tmp/five"

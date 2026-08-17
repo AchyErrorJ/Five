@@ -1,6 +1,7 @@
 mod audio;
 mod config;
 mod transcribe;
+mod voice;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -40,6 +41,11 @@ enum Command {
     /// Live pipeline test: Enter simulates the wake word, then records a
     /// command and transcribes it (no rustpotter model needed)
     Listen,
+    /// Speak text aloud through the default output (tests TTS)
+    Speak {
+        /// Text to speak
+        text: String,
+    },
 }
 
 fn init_tracing(level: &str) {
@@ -141,6 +147,12 @@ async fn main() -> anyhow::Result<()> {
             let config = load_config(&cli.config)?;
             init_tracing(&config.logging.level);
             listen_loop(&config)?;
+        }
+        Some(Command::Speak { text }) => {
+            let config = load_config(&cli.config)?;
+            init_tracing(&config.logging.level);
+            let speaker = voice::Speaker::load(&config.voice).await?;
+            speaker.say(&text).await?;
         }
         None => {
             let config = load_config(&cli.config)?;

@@ -14,6 +14,8 @@ pub struct AppConfig {
     pub openclaw: OpenClawConfig,
     /// Ambient recording settings
     pub ambient: AmbientConfig,
+    /// Text-to-speech (voice output) settings
+    pub voice: VoiceConfig,
     /// Logging configuration
     pub logging: LoggingConfig,
 }
@@ -76,6 +78,18 @@ pub struct AmbientConfig {
     pub log_dir: PathBuf,
     /// Maximum number of ambient files to keep
     pub max_files: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VoiceConfig {
+    /// Path to the Kokoro ONNX model
+    pub model_path: PathBuf,
+    /// Directory containing voice .bin files (or a single .bin file)
+    pub voices_dir: PathBuf,
+    /// Voice name, Kokoro convention (e.g. "af_heart", "bm_george")
+    pub voice: String,
+    /// Speech speed multiplier (1.0 = normal)
+    pub speed: f32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -36,6 +36,9 @@ impl Transcriber {
                 config.model_path.display()
             );
         }
+        // Route whisper.cpp/ggml native logs through `log` instead of stderr;
+        // otherwise every inference dumps token-level spam to the console.
+        whisper_rs::install_logging_hooks();
         let start = Instant::now();
         let ctx = WhisperContext::new_with_params(
             &config.model_path.to_string_lossy(),
