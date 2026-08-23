@@ -5,3 +5,4 @@ config.local.yaml
 # Downloaded model artifacts (fetch per-machine, see HANDOFF.md §8)
 /models/
 /voices/
+config.dev.yaml

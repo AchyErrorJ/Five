@@ -16,6 +16,9 @@ pub struct AppConfig {
     pub ambient: AmbientConfig,
     /// Text-to-speech (voice output) settings
     pub voice: VoiceConfig,
+    /// On-screen captions while Five speaks (desktop notification)
+    #[serde(default)]
+    pub captions: CaptionsConfig,
     /// Logging configuration
     pub logging: LoggingConfig,
 }
@@ -46,6 +49,21 @@ pub struct WakeWordConfig {
     pub model_path: PathBuf,
     /// Detection threshold — minimum average score (0.0 - 1.0)
     pub threshold: f32,
+    /// Consecutive above-threshold frames required to fire (rustpotter
+    /// min_scores). 2 catches short, crisp utterances; raise if background
+    /// speech starts false-triggering.
+    #[serde(default = "default_min_scores")]
+    pub min_scores: usize,
+    /// rustpotter avg_threshold: score against the averaged wakeword features.
+    /// 0.0 disables the gate. Live utterances can score well above `threshold`
+    /// yet have low avg similarity (avg≈0.2 vs default gate≈0.6) and get
+    /// silently discarded — disable unless false positives appear.
+    #[serde(default)]
+    pub avg_threshold: f32,
+}
+
+fn default_min_scores() -> usize {
+    2
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -97,6 +115,18 @@ pub struct VoiceConfig {
     pub voice: String,
     /// Speech speed multiplier (1.0 = normal)
     pub speed: f32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CaptionsConfig {
+    /// Show the spoken text as a desktop notification while Five speaks
+    pub enabled: bool,
+}
+
+impl Default for CaptionsConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

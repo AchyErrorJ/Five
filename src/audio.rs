@@ -95,8 +95,10 @@ fn open_pcm(config: &AudioConfig) -> anyhow::Result<PCM> {
             .with_context(|| format!("device does not support format {}", config.format))?;
         hwp.set_access(Access::RWInterleaved)
             .context("device does not support interleaved access")?;
-        // Buffer ~4 chunks so brief downstream hiccups don't overrun.
-        hwp.set_buffer_size((chunk_frames * 4) as i64)
+        // Buffer ~16 chunks (1.6s) — 4 chunks (400ms) overran with EPIPE
+        // ("Broken pipe") whenever TTS/whisper stalled the read loop, and the
+        // dropped frames silently killed wake word matches.
+        hwp.set_buffer_size((chunk_frames * 16) as i64)
             .context("failed to set buffer size")?;
         hwp.set_period_size(chunk_frames as i64, ValueOr::Nearest)
             .context("failed to set period size")?;

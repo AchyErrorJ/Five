@@ -9,8 +9,10 @@ audio:
   chunk_ms: 100
 
 wakeword:
-  model_path: "/opt/five/models/five.rpw"
-  threshold: 0.5
+  model_path: "models/five.rpw"
+  threshold: 0.6
+  min_scores: 2
+  avg_threshold: 0.0
 
 transcription:
   model_path: "models/ggml-base.en.bin"
@@ -20,7 +22,7 @@ transcription:
 openclaw:
   endpoint: "http://127.0.0.1:10000"
   timeout_sec: 30
-  password: "changeme"
+  password: "CHANGE_ME"
   from_agent: "five"
   to_agent: "five"
 
@@ -36,6 +38,9 @@ voice:
   voices_dir: "voices"
   voice: "af_heart"
   speed: 1.0
+
+captions:
+  enabled: true
 
 logging:
   level: "info"

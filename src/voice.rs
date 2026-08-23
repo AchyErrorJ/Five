@@ -16,7 +16,7 @@ use tracing::{debug, info};
 use crate::config::VoiceConfig;
 
 /// Kokoro's output sample rate (fixed by the model).
-const TTS_SAMPLE_RATE: u32 = 24_000;
+pub const TTS_SAMPLE_RATE: u32 = 24_000;
 
 /// A loaded TTS engine plus the configured voice.
 pub struct Speaker {
@@ -47,13 +47,10 @@ impl Speaker {
         Ok(Self { tts, voice: config.voice.clone(), speed: config.speed })
     }
 
-    /// Synthesize `text` and play it through the default output.
-    pub async fn say(&self, text: &str) -> anyhow::Result<()> {
-        let samples = self.synthesize(text).await?;
-        play(&samples, TTS_SAMPLE_RATE)
-    }
-
     /// Synthesize `text` to 24 kHz mono f32 samples without playing them.
+    /// The caller decides what to do with them — `play()` to speak, and
+    /// `samples.len() / TTS_SAMPLE_RATE` gives the exact speech duration
+    /// (used to time on-screen captions).
     pub async fn synthesize(&self, text: &str) -> anyhow::Result<Vec<f32>> {
         let voice = Voice::new(&*self.voice).with_speed(self.speed);
         let start = Instant::now();
