@@ -41,7 +41,7 @@ impl Transcriber {
         whisper_rs::install_logging_hooks();
         let start = Instant::now();
         let ctx = WhisperContext::new_with_params(
-            &config.model_path.to_string_lossy(),
+            &config.model_path,
             WhisperContextParameters::default(),
         )
         .with_context(|| format!("failed to load whisper model {}", config.model_path.display()))?;
@@ -75,13 +75,14 @@ impl Transcriber {
             .context("whisper inference failed")?;
         let elapsed = start.elapsed();
 
-        let n = state.full_n_segments().context("failed to read segment count")?;
+        let n = state.full_n_segments();
         let mut segments = Vec::with_capacity(n as usize);
         for i in 0..n {
+            let Some(seg) = state.get_segment(i) else { continue };
             // whisper timestamps are in 10 ms ticks.
-            let t0 = state.full_get_segment_t0(i)? * 10;
-            let t1 = state.full_get_segment_t1(i)? * 10;
-            let text = state.full_get_segment_text_lossy(i)?.trim().to_string();
+            let t0 = seg.start_timestamp() * 10;
+            let t1 = seg.end_timestamp() * 10;
+            let text = seg.to_str_lossy()?.trim().to_string();
             if !text.is_empty() {
                 segments.push(Segment { text, start_ms: t0, end_ms: t1 });
             }

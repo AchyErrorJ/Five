@@ -1,4 +1,5 @@
 mod audio;
+mod brain;
 mod captions;
 mod config;
 mod openclaw;
@@ -73,6 +74,8 @@ enum Command {
         /// Text to speak
         text: String,
     },
+    /// List audio output devices (for the audio.output_device config key)
+    Devices,
 }
 
 /// Speak `text` aloud, showing an on-screen caption for exactly the
@@ -81,15 +84,18 @@ async fn say_with_caption(
     speaker: &voice::Speaker,
     text: &str,
     captions_enabled: bool,
+    device: Option<&str>,
 ) -> anyhow::Result<()> {
+    let t0 = std::time::Instant::now();
     let samples = speaker.synthesize(text).await?;
+    tracing::info!(synth_ms = t0.elapsed().as_millis() as u64, "speech synthesized");
     if captions_enabled {
         let speech = std::time::Duration::from_secs_f32(
             samples.len() as f32 / voice::TTS_SAMPLE_RATE as f32,
         );
         captions::show(text, speech);
     }
-    voice::play(&samples, voice::TTS_SAMPLE_RATE)
+    voice::play_out(&samples, voice::TTS_SAMPLE_RATE, device)
 }
 
 fn init_tracing(level: &str) {
@@ -127,12 +133,230 @@ fn strip_wakeword(text: &str) -> String {
         .to_string()
 }
 
-/// Full assistant loop: rustpotter listens for the wake word on the live
-/// stream, then records a command, transcribes, dispatches to Orchestre,
-/// and speaks the reply. A pre-trigger ring buffer keeps the ~2s before
-/// detection fires — rustpotter only finalizes a detection once its match
-/// window expires (~0.5s after the wakeword peak), and by then the user may
-/// already be mid-command, so the ring keeps the first syllables.
+/// Whisper renders music, silence, and ambient noise as parenthesized junk —
+/// "(upbeat music)", "[Music]", "♪". Always-listening mode would otherwise
+/// log (and scan for the trigger word on) one of these every few seconds
+/// whenever media is playing near the mic.
+fn is_non_speech(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty()
+        || (t.starts_with(['(', '[']) && t.ends_with([')', ']']))
+        || t.chars().all(|c| !c.is_alphanumeric())
+    {
+        return true;
+    }
+    // Whisper's classic hallucinations on background music/TV — short,
+    // fixed phrases it emits when there's no real speech.
+    const HALLUCINATIONS: &[&str] = &[
+        "you", "thank you", "thank you.", "thanks", "thanks for watching",
+        "bye", "bye-bye", "so", "okay", "hmm", "uh-huh",
+    ];
+    HALLUCINATIONS.iter().any(|h| t.eq_ignore_ascii_case(h))
+}
+
+/// Find the word "five" (or "5") in a transcript and return everything
+/// after it. Whole-word match only — "fiver" must not trigger. This is the
+/// text-mode wake word: whisper hears "five" reliably even when rustpotter's
+/// MFCC templates don't.
+fn extract_command(text: &str) -> Option<String> {
+    let mut pos = 0;
+    while pos < text.len() {
+        let ws = match text[pos..].find(|c: char| c.is_alphanumeric()) {
+            Some(i) => pos + i,
+            None => return None,
+        };
+        let we = text[ws..]
+            .find(|c: char| !c.is_alphanumeric())
+            .map(|i| ws + i)
+            .unwrap_or(text.len());
+        let word = &text[ws..we];
+        if word.eq_ignore_ascii_case("five") || word == "5" {
+            let rest = text[we..]
+                .trim_start_matches([',', '.', '!', '?', ';', ':', ' '])
+                .trim();
+            return Some(rest.to_string());
+        }
+        pos = we;
+    }
+    None
+}
+
+/// Deterministic local answers for questions an LLM can only hallucinate —
+/// time and date come from the system clock, phrased for speech. Anything
+/// not matched here falls through to the brain/agents.
+fn local_answer(text: &str) -> Option<String> {
+    let t = text.to_lowercase();
+    let now = chrono::Local::now();
+    if t.contains("time") && (t.contains("what") || t.contains("current") || t.contains("tell")) {
+        return Some(now.format("It's %-I:%M %p.").to_string());
+    }
+    if (t.contains("date") || t.contains("day is")) && (t.contains("what") || t.contains("today")) {
+        return Some(now.format("It's %A, %B %-d.").to_string());
+    }
+    None
+}
+
+/// Adaptive noise floor for endpointing. The fixed 0.01 RMS silence
+/// threshold never tripped on the Yeti (its idle floor sits higher), so
+/// every utterance ran out to the 10s cap — 9s of whisper per command.
+/// Track a slow EMA of quiet-chunk RMS and call anything under 3x the
+/// floor "silence"; the floor self-calibrates to whatever mic and room
+/// the daemon runs in.
+struct NoiseFloor(f32);
+
+impl NoiseFloor {
+    fn new() -> Self {
+        Self(0.01) // seed near the old fixed threshold
+    }
+    fn threshold(&self) -> f32 {
+        (self.0 * 3.0).clamp(0.0015, 0.05)
+    }
+    /// Returns true when this chunk counts as silence.
+    fn is_silence(&mut self, rms: f32) -> bool {
+        let quiet = rms < self.threshold();
+        if quiet {
+            self.0 = self.0 * 0.95 + rms * 0.05;
+        } else {
+            // loud environment: let the floor drift up slowly
+            self.0 = self.0 * 0.999 + rms.min(0.02) * 0.001;
+        }
+        quiet
+    }
+}
+
+/// Split a reply into speakable sentences (keeping their punctuation), so
+/// streaming playback can start on sentence one while the rest synthesize.
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in text.chars() {
+        cur.push(c);
+        if matches!(c, '.' | '!' | '?') {
+            let s = cur.trim().to_string();
+            if !s.is_empty() {
+                out.push(s);
+            }
+            cur.clear();
+        }
+    }
+    let s = cur.trim().to_string();
+    if !s.is_empty() {
+        out.push(s);
+    }
+    out
+}
+
+/// Speak a reply sentence-by-sentence: synthesize sentence N+1 while
+/// sentence N is still playing. A multi-sentence reply starts sounding
+/// after ONE sentence's synth time instead of the whole reply's — with
+/// kokoro at ~1.2s/sentence that's most of the perceived latency gone.
+fn say_streamed(
+    speaker: &voice::Speaker,
+    text: &str,
+    rt: &tokio::runtime::Runtime,
+    device: Option<&str>,
+) -> anyhow::Result<()> {
+    let device = device.map(|d| d.to_string());
+    let sentences = split_sentences(text);
+    let mut playing: Option<std::thread::JoinHandle<()>> = None;
+    for sentence in &sentences {
+        let t0 = std::time::Instant::now();
+        let samples = rt.block_on(speaker.synthesize(sentence))?;
+        tracing::info!(synth_ms = t0.elapsed().as_millis() as u64, sentence, "sentence synthesized");
+        if let Some(h) = playing.take() {
+            let _ = h.join();
+        }
+        let device = device.clone();
+        playing = Some(std::thread::spawn(move || {
+            if let Err(e) = voice::play_out(&samples, voice::TTS_SAMPLE_RATE, device.as_deref()) {
+                tracing::error!("playback failed: {e:#}");
+            }
+        }));
+    }
+    if let Some(h) = playing {
+        let _ = h.join();
+    }
+    Ok(())
+}
+
+/// Route one recognized command: append to the bridge file, answer locally
+/// (local 4B / Kimi) and speak its reply, or dispatch to Orchestre.
+fn dispatch_command(
+    text: &str,
+    bridge: &Option<PathBuf>,
+    brain: &Option<brain::Brain>,
+    client: &Option<openclaw::OrchestreClient>,
+    speaker: &voice::Speaker,
+    rt: &tokio::runtime::Runtime,
+    captions_enabled: bool,
+    device: Option<&str>,
+) -> anyhow::Result<()> {
+    println!(">> {text}");
+    if let Some(path) = bridge {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("failed to open bridge {}", path.display()))?;
+        writeln!(f, "{text}")?;
+        println!("<< [bridged to Claude Code]");
+        return Ok(());
+    }
+    if let Some(brain) = brain {
+        let reply = match local_answer(text) {
+            Some(reply) => {
+                tracing::info!("answered locally (deterministic command)");
+                reply
+            }
+            None => {
+                let t0 = std::time::Instant::now();
+                match rt.block_on(brain.respond(text)) {
+                    Ok(reply) => {
+                        tracing::info!(brain_ms = t0.elapsed().as_millis() as u64, "brain replied");
+                        reply
+                    }
+                    Err(e) => {
+                        tracing::error!("brain failed: {e:#}");
+                        return Ok(());
+                    }
+                }
+            }
+        };
+        println!("<< {reply}");
+        if let Err(e) = say_streamed(speaker, &reply, rt, device) {
+            tracing::error!("speech failed: {e:#}");
+        }
+        return Ok(());
+    }
+    let client = client.as_ref().expect("client when no bridge and no brain");
+    match rt.block_on(client.send_command(text)) {
+        Ok(result) => {
+            println!(
+                "<< [{}] {}",
+                result.status,
+                result.response.as_deref().unwrap_or("(no reply)")
+            );
+            if let Some(reply) = result.response {
+                if let Err(e) = rt.block_on(say_with_caption(speaker, &reply, captions_enabled, device)) {
+                    tracing::error!("speech failed: {e:#}");
+                }
+            }
+        }
+        Err(e) => tracing::error!("orchestrator dispatch failed: {e:#}"),
+    }
+    Ok(())
+}
+
+/// Full assistant loop. With `wakeword.enabled` (rustpotter): listens for
+/// the wake word on the live stream, then records a command. With it
+/// disabled (text trigger): every speech utterance is transcribed and a
+/// whole-word "five" in the text fires the command — whisper is a far more
+/// reliable "five" detector than the .rpw templates. Either way the command
+/// is dispatched and the reply spoken. A pre-trigger ring buffer keeps the
+/// ~2s before detection fires — rustpotter only finalizes a detection once
+/// its match window expires (~0.5s after the wakeword peak), and by then the
+/// user may already be mid-command, so the ring keeps the first syllables.
 fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()> {
     use std::collections::VecDeque;
 
@@ -144,18 +368,33 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
 
     let transcriber = transcribe::Transcriber::load(&config.transcription)?;
     let speaker = rt.block_on(voice::Speaker::load(&config.voice))?;
-    // Bridge mode skips the orchestrator entirely — commands go to a file
-    // for a local Claude Code session; it speaks its own replies.
-    let client = if bridge.is_none() {
+    // Routing precedence: bridge file > brain > Orchestre. Bridge mode skips
+    // both — commands go to a file for a local Claude Code session, which
+    // speaks its own replies.
+    let brain = if bridge.is_none() && config.brain.enabled {
+        Some(brain::Brain::new(&config.brain)?)
+    } else {
+        None
+    };
+    let client = if bridge.is_none() && brain.is_none() {
         Some(openclaw::OrchestreClient::new(&config.openclaw)?)
     } else {
         None
     };
     let capture = audio::AudioCapture::start(&config.audio)?;
-    let mut detector = wakeword::build_detector(&config.wakeword)?;
+    let out_device = config.audio.output_device.as_deref();
+    let text_trigger = !config.wakeword.enabled;
+    let mut detector = if text_trigger {
+        None
+    } else {
+        Some(wakeword::build_detector(&config.wakeword)?)
+    };
 
     let rate = config.audio.target_rate as usize;
-    let frame = detector.get_samples_per_frame();
+    let frame = detector
+        .as_ref()
+        .map(|d| d.get_samples_per_frame())
+        .unwrap_or(rate / 10);
     let command_len = rate * config.transcription.command_duration_sec as usize;
     let ring_cap = rate * 2; // 2s of pre-trigger audio
     let mut ring: VecDeque<f32> = VecDeque::with_capacity(ring_cap);
@@ -168,23 +407,34 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
     // command_duration_sec — a fixed 10s window made every reply feel laggy.
     let min_command = rate; // 1s
     let silence_limit = rate * 3 / 2; // 1.5s
-    let silence_rms: f32 = 0.01; // speech RMS ≈0.04, room noise well under 0.005
+    let mut noise = NoiseFloor::new();
     let mut trailing_silence = 0usize;
+    // Text-trigger mode: utterance accumulator (endpointed the same way as
+    // commands — fire after 1.5s of trailing silence, min 0.5s of speech).
+    let mut utterance: Vec<f32> = Vec::new();
+    let mut speech_total = 0usize;
     // FIVE_DEBUG_SCORES=1 logs every partial detection above a noise floor —
     // for diagnosing "wake word never fires" on the live mic.
     let debug_scores = std::env::var("FIVE_DEBUG_SCORES").is_ok();
+    // Normalize detector input — the templates are level-normalized, so the
+    // live stream must be too (mic volume varies hugely between utterances).
+    let mut agc = wakeword::Agc::new();
 
-    tracing::info!(
-        threshold = config.wakeword.threshold,
-        min_scores = config.wakeword.min_scores,
-        "listening for wake word (Ctrl-C to quit)"
-    );
+    if text_trigger {
+        tracing::info!("always listening — transcribing speech, trigger word: five (Ctrl-C to quit)");
+    } else {
+        tracing::info!(
+            threshold = config.wakeword.threshold,
+            min_scores = config.wakeword.min_scores,
+            "listening for wake word (Ctrl-C to quit)"
+        );
+    }
 
     while let Some(chunk) = capture.recv() {
         // --- Collecting a command: accumulate until command_len, then handle.
         if let Some(buf) = &mut command {
             let rms = (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len().max(1) as f32).sqrt();
-            if rms < silence_rms {
+            if noise.is_silence(rms) {
                 trailing_silence += chunk.len();
             } else {
                 trailing_silence = 0;
@@ -201,39 +451,17 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                     let text = strip_wakeword(&text);
                     if text.is_empty() {
                         println!(">> (nothing recognized)");
-                    } else {
-                        println!(">> {text}");
-                        if let Some(path) = &bridge {
-                            use std::io::Write;
-                            let mut f = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(path)
-                                .with_context(|| format!("failed to open bridge {}", path.display()))?;
-                            writeln!(f, "{text}")?;
-                            println!("<< [bridged to Claude Code]");
-                        } else {
-                            let client = client.as_ref().expect("client when no bridge");
-                            match rt.block_on(client.send_command(&text)) {
-                            Ok(result) => {
-                                println!(
-                                    "<< [{}] {}",
-                                    result.status,
-                                    result.response.as_deref().unwrap_or("(no reply)")
-                                );
-                                if let Some(reply) = result.response {
-                                    if let Err(e) = rt.block_on(say_with_caption(
-                                        &speaker,
-                                        &reply,
-                                        config.captions.enabled,
-                                    )) {
-                                        tracing::error!("speech failed: {e:#}");
-                                    }
-                                }
-                            }
-                            Err(e) => tracing::error!("orchestrator dispatch failed: {e:#}"),
-                            }
-                        }
+                    } else if let Err(e) = dispatch_command(
+                        &text,
+                        &bridge,
+                        &brain,
+                        &client,
+                        &speaker,
+                        &rt,
+                        config.captions.enabled,
+                        out_device,
+                    ) {
+                        tracing::error!("dispatch failed: {e:#}");
                     }
                 }
                 Err(e) => tracing::error!("transcription failed: {e:#}"),
@@ -243,8 +471,74 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
             while capture.receiver().try_recv().is_ok() {}
             pending.clear();
             ring.clear();
-            detector.reset();
+            if let Some(det) = &mut detector {
+                det.reset();
+            }
+            agc = wakeword::Agc::new();
             tracing::info!("listening for wake word");
+            continue;
+        }
+
+        // --- Text-trigger listening: endpoint each utterance, transcribe it,
+        // fire when the text contains the word "five".
+        if text_trigger {
+            let rms = (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len().max(1) as f32).sqrt();
+            if !noise.is_silence(rms) {
+                speech_total += chunk.len();
+                trailing_silence = 0;
+            } else {
+                trailing_silence += chunk.len();
+            }
+            utterance.extend_from_slice(&chunk);
+            let endpointed = speech_total >= rate / 2 && trailing_silence >= silence_limit;
+            if utterance.len() < command_len && !endpointed {
+                continue;
+            }
+            let audio = std::mem::take(&mut utterance);
+            speech_total = 0;
+            trailing_silence = 0;
+            let t0 = std::time::Instant::now();
+            let text = match transcriber.transcribe_to_string(&audio) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!("transcription failed: {e:#}");
+                    continue;
+                }
+            };
+            tracing::info!(
+                stt_ms = t0.elapsed().as_millis() as u64,
+                audio_ms = audio.len() * 1000 / rate,
+                "utterance transcribed"
+            );
+            if is_non_speech(&text) {
+                continue;
+            }
+            match extract_command(&text) {
+                Some(cmd) if !cmd.is_empty() => {
+                    if let Err(e) = dispatch_command(
+                        &cmd,
+                        &bridge,
+                        &brain,
+                        &client,
+                        &speaker,
+                        &rt,
+                        config.captions.enabled,
+                        out_device,
+                    ) {
+                        tracing::error!("dispatch failed: {e:#}");
+                    }
+                    // Drop Five's own reply from the mic queue so it isn't
+                    // transcribed back as a new utterance.
+                    while capture.receiver().try_recv().is_ok() {}
+                }
+                Some(_) => {
+                    // Bare "five" with nothing after: record a fresh command.
+                    tracing::info!("wake word heard — recording command");
+                    command = Some(Vec::with_capacity(command_len));
+                    while capture.receiver().try_recv().is_ok() {}
+                }
+                None => println!(".. (ignored: {})", text.trim()),
+            }
             continue;
         }
 
@@ -259,10 +553,12 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
         }
         pending.extend_from_slice(&chunk);
         while pending.len() >= frame {
-            let f: Vec<f32> = pending.drain(..frame).collect();
-            let hit = detector.process_samples(f).is_some();
+            let mut f: Vec<f32> = pending.drain(..frame).collect();
+            agc.process(&mut f);
+            let det = detector.as_mut().expect("detector in rustpotter mode");
+            let hit = det.process_samples(f).is_some();
             if debug_scores {
-                if let Some(p) = detector.get_partial_detection() {
+                if let Some(p) = det.get_partial_detection() {
                     if p.score > 0.2 {
                         tracing::info!(score = p.score, avg = p.avg_score, counter = p.counter, "partial detection");
                     }
@@ -329,11 +625,22 @@ async fn main() -> anyhow::Result<()> {
             init_tracing(&config.logging.level);
             wakeword::evaluate(&samples, &config.wakeword)?;
         }
+        Some(Command::Devices) => {
+            for name in voice::output_devices() {
+                println!("{name}");
+            }
+        }
         Some(Command::Speak { text }) => {
             let config = load_config(&cli.config)?;
             init_tracing(&config.logging.level);
             let speaker = voice::Speaker::load(&config.voice).await?;
-            say_with_caption(&speaker, &text, config.captions.enabled).await?;
+            say_with_caption(
+                &speaker,
+                &text,
+                config.captions.enabled,
+                config.audio.output_device.as_deref(),
+            )
+            .await?;
         }
         None => {
             let config = load_config(&cli.config)?;

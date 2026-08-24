@@ -15,6 +15,41 @@ use rustpotter::{
 use crate::config::WakeWordConfig;
 use crate::transcribe;
 
+/// Streaming automatic gain control for the detector input. Rustpotter
+/// templates are amplitude-sensitive: a model trained on loud samples scores
+/// a genuine "five" at 0.000 when it's spoken at 3% peak instead of 30%.
+/// This normalizes the stream toward TARGET_RMS with a smoothed, clamped
+/// gain; frames at room-noise level pass through untouched so silence stays
+/// silence and the max gain can't blow room tone up into "speech".
+pub struct Agc {
+    rms: f32, // EMA of recent input RMS
+}
+
+impl Agc {
+    const TARGET_RMS: f32 = 0.05; // ≈ clear speech after normalization
+    const MAX_GAIN: f32 = 12.0;
+    const NOISE_FLOOR: f32 = 0.004;
+
+    pub fn new() -> Self {
+        Self { rms: Self::TARGET_RMS }
+    }
+
+    pub fn process(&mut self, samples: &mut [f32]) {
+        if samples.is_empty() {
+            return;
+        }
+        let in_rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
+        if in_rms >= Self::NOISE_FLOOR {
+            // EMA over speech frames only — silence mustn't crank the gain.
+            self.rms = 0.7 * self.rms + 0.3 * in_rms;
+            let gain = (Self::TARGET_RMS / self.rms.max(1e-4)).clamp(1.0, Self::MAX_GAIN);
+            for s in samples.iter_mut() {
+                *s = (*s * gain).clamp(-1.0, 1.0);
+            }
+        }
+    }
+}
+
 /// MFCC coefficients per frame at build time. Stored inside the .rpw; the
 /// detector adapts to it at load, so 40 (rustpotter's own default) is safe.
 const MFCC_SIZE: u16 = 40;
@@ -120,7 +155,16 @@ pub fn train(samples_dir: &Path, output: &Path) -> anyhow::Result<()> {
     for f in &files {
         let (samples, rate) = transcribe::read_wav(f)?;
         match trim_to_speech(&samples, rate as usize) {
-            Some(trimmed) if trimmed.len() >= rate as usize / 5 => {
+            Some(mut trimmed) if trimmed.len() >= rate as usize / 5 => {
+                // Peak-normalize every template to the same level — otherwise
+                // the model bakes in each recording's mic level and only ever
+                // matches utterances at that exact volume.
+                let peak = trimmed.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+                if peak > 1e-4 {
+                    for s in trimmed.iter_mut() {
+                        *s *= 0.5 / peak;
+                    }
+                }
                 let name = f.file_name().unwrap().to_string_lossy().into_owned();
                 println!(
                     "  {name:<16} kept {:.2}s of {:.2}s",
@@ -168,13 +212,16 @@ fn score_file(detector: &mut Rustpotter, path: &Path) -> anyhow::Result<(bool, f
     let silence = vec![0.0f32; frame * 50];
     let stream: Vec<f32> = samples.iter().copied().chain(silence).collect();
     let debug = std::env::var("FIVE_DEBUG_SCORES").is_ok();
+    let mut agc = Agc::new();
     let mut max_score: f32 = 0.0;
     let mut detected = false;
     for (i, chunk) in stream.chunks(frame).enumerate() {
         if chunk.len() < frame {
             break; // process_samples silently ignores short frames
         }
-        let det = detector.process_samples(chunk.to_vec());
+        let mut normed = chunk.to_vec();
+        agc.process(&mut normed);
+        let det = detector.process_samples(normed);
         if debug {
             match detector.get_partial_detection() {
                 Some(p) => println!(

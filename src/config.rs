@@ -19,21 +19,36 @@ pub struct AppConfig {
     /// On-screen captions while Five speaks (desktop notification)
     #[serde(default)]
     pub captions: CaptionsConfig,
+    /// LLM routing: local 4B for easy asks, Kimi coding API for the rest
+    #[serde(default)]
+    pub brain: BrainConfig,
     /// Logging configuration
     pub logging: LoggingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AudioConfig {
-    /// ALSA card number (e.g., 2 for Blue Yeti Nano)
+    /// ALSA card number (e.g., 2 for Blue Yeti Nano) — Linux only
+    #[serde(default)]
     pub alsa_card: u32,
-    /// ALSA device number (e.g., 0)
+    /// ALSA device number (e.g., 0) — Linux only
+    #[serde(default)]
     pub alsa_device: u32,
-    /// Hardware sample rate in Hz (e.g., 48000)
+    /// Input device name substring — Windows only (None = system default)
+    #[serde(default)]
+    pub input_device: Option<String>,
+    /// Windows output device name (substring match); None = system default
+    #[serde(default)]
+    pub output_device: Option<String>,
+    /// Hardware sample rate in Hz (e.g., 48000) — Linux only; Windows uses
+    /// the device's native rate
+    #[serde(default = "default_sample_rate")]
     pub sample_rate: u32,
-    /// Hardware channels (e.g., 2 for stereo)
+    /// Hardware channels (e.g., 2 for stereo) — Linux only
+    #[serde(default = "default_channels")]
     pub channels: u16,
-    /// ALSA format string (e.g., "S24_3LE")
+    /// ALSA format string (e.g., "S24_3LE") — Linux only
+    #[serde(default = "default_format")]
     pub format: String,
     /// Target sample rate after resampling (e.g., 16000)
     pub target_rate: u32,
@@ -43,8 +58,24 @@ pub struct AudioConfig {
     pub chunk_ms: u64,
 }
 
+fn default_sample_rate() -> u32 {
+    48000
+}
+fn default_channels() -> u16 {
+    2
+}
+fn default_format() -> String {
+    "S24_3LE".into()
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WakeWordConfig {
+    /// When false, skip rustpotter entirely: the listen loop transcribes
+    /// every utterance and triggers on the word "five" in the TEXT. Far
+    /// more robust — the .rpw templates kept matching the recording
+    /// session's room tone instead of the spoken word.
+    #[serde(default = "default_wakeword_enabled")]
+    pub enabled: bool,
     /// Path to the rustpotter wake word model (.rpw)
     pub model_path: PathBuf,
     /// Detection threshold — minimum average score (0.0 - 1.0)
@@ -60,6 +91,10 @@ pub struct WakeWordConfig {
     /// silently discarded — disable unless false positives appear.
     #[serde(default)]
     pub avg_threshold: f32,
+}
+
+fn default_wakeword_enabled() -> bool {
+    true
 }
 
 fn default_min_scores() -> usize {
@@ -115,6 +150,11 @@ pub struct VoiceConfig {
     pub voice: String,
     /// Speech speed multiplier (1.0 = normal)
     pub speed: f32,
+    /// ONNX Runtime execution provider: "auto" (GPU if available) or "cpu".
+    /// Maps to kokoro-en's KOKORO_ORT_PROVIDER. DirectML on the AMD iGPU
+    /// intermittently fails Kokoro's ConvTranspose node, so Windows = "cpu".
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -127,6 +167,70 @@ impl Default for CaptionsConfig {
     fn default() -> Self {
         Self { enabled: true }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BrainConfig {
+    /// Master switch — when false, listen falls back to bridge/orchestrator
+    #[serde(default)]
+    pub enabled: bool,
+    /// LM Studio OpenAI-compatible base URL (no trailing slash)
+    #[serde(default = "default_local_url")]
+    pub local_url: String,
+    /// Local model id (as listed by GET /v1/models)
+    #[serde(default = "default_local_model")]
+    pub local_model: String,
+    /// Kimi (Moonshot) OpenAI-compatible base URL
+    #[serde(default = "default_kimi_url")]
+    pub kimi_url: String,
+    /// Kimi model id
+    #[serde(default = "default_kimi_model")]
+    pub kimi_model: String,
+    /// File containing ONLY the Kimi API key (kept out of the config so the
+    /// config can be committed). None = Kimi route unavailable.
+    #[serde(default)]
+    pub kimi_key_file: Option<PathBuf>,
+    /// Max completion tokens per reply. NOTE: the user's 16K budget is the
+    /// model's context window; replies are spoken so they stay small.
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+    /// Request timeout in seconds (local 4B on iGPU can be slow to start)
+    #[serde(default = "default_brain_timeout")]
+    pub timeout_sec: u64,
+}
+
+impl Default for BrainConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            local_url: default_local_url(),
+            local_model: default_local_model(),
+            kimi_url: default_kimi_url(),
+            kimi_model: default_kimi_model(),
+            kimi_key_file: None,
+            max_tokens: default_max_tokens(),
+            timeout_sec: default_brain_timeout(),
+        }
+    }
+}
+
+fn default_local_url() -> String {
+    "http://127.0.0.1:1234/v1".into()
+}
+fn default_local_model() -> String {
+    "qwen3.5-4b-mp".into()
+}
+fn default_kimi_url() -> String {
+    "https://api.moonshot.ai/v1".into()
+}
+fn default_kimi_model() -> String {
+    "kimi-k2-0905-preview".into()
+}
+fn default_max_tokens() -> u32 {
+    512
+}
+fn default_brain_timeout() -> u64 {
+    120
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

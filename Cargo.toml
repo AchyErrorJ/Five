@@ -9,9 +9,14 @@ description = "Voice assistant daemon for OpenClaw integration"
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
 
-# Audio (ALSA directly — no cpal abstraction layer)
-alsa = "0.9"
+# Audio: ALSA on Linux (see HANDOFF.md §2), cpal/WASAPI on Windows
 rubato = "0.15"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa = "0.9"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+cpal = "0.15"
 
 # Wake word (pure Rust)
 rustpotter = "3"
@@ -21,7 +26,10 @@ rustpotter = "3"
 half = "=2.4.1"
 
 # Speech-to-text (Rust FFI bindings to whisper.cpp — same ggml models, no subprocess)
-whisper-rs = "0.14"
+# NOTE: the `vulkan` feature (GPU whisper on the AMD iGPU) fails to build on
+# Windows — ggml's nested vulkan-shaders-gen ExternalProject blows the 260-
+# char path limit even with a short CARGO_TARGET_DIR. CPU + tiny.en for now.
+whisper-rs = "0.16"
 
 # Audio file I/O
 hound = "3.5"
@@ -49,8 +57,6 @@ clap = { version = "4.4", features = ["derive"] }
 # Utilities
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
-# Process management
-nix = { version = "0.27", features = ["process"] }
 kokoro-en = "0.1.5"
 
 [profile.release]

@@ -6,3 +6,15 @@ config.local.yaml
 /models/
 /voices/
 config.dev.yaml
+
+kimi-key.txt
+
+# Local test/debug artifacts
+*.wav
+listen*.txt
+listen.pid
+err.txt
+t?.txt
+eval-debug*.txt
+/tmp-eval/
+bridge.txt

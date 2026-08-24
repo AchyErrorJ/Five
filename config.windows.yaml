@@ -1,0 +1,74 @@
+# five-daemon config for Windows (Legion Go).
+# Uses the system default input/output devices via WASAPI; ALSA fields are
+# omitted (they have serde defaults and are ignored on Windows).
+
+audio:
+  # input_device: "Microphone Array"   # uncomment to pick a specific mic;
+  #                                     # substring match, case-sensitive
+  # Windows default output is the Esinkin BT headphones — send replies to
+  # the Realtek stereo speakers instead (substring match, case-insensitive).
+  output_device: "Realtek"
+  target_rate: 16000
+  target_channels: 1
+  chunk_ms: 100
+
+wakeword:
+  # Text trigger: transcribe every utterance, fire on the word "five" in
+  # the text. The .rpw model matched its training session's room tone, not
+  # the word — whisper is the reliable detector.
+  enabled: false
+  model_path: "models/five.rpw"
+  # Positives score 0.727+, music/speech negatives max 0.617 — 0.68 splits them
+  threshold: 0.68
+  min_scores: 2
+  avg_threshold: 0.0
+
+transcription:
+  # tiny.en: ~4x faster than base.en on CPU (2-3s per utterance vs 9s) —
+  # always-listening transcribes EVERY utterance, so speed beats accuracy
+  # here; command phrases are short and survive tiny fine.
+  model_path: "models/ggml-tiny.en.bin"
+  command_duration_sec: 10
+  sample_rate: 16000
+
+openclaw:
+  endpoint: "http://127.0.0.1:10000"
+  timeout_sec: 30
+  password: "CHANGE_ME"
+  from_agent: "five"
+  to_agent: "five"
+
+ambient:
+  enabled: false
+  interval_min: 15
+  duration_sec: 30
+  log_dir: "logs/ambient"
+  max_files: 100
+
+voice:
+  model_path: "models/kokoro/model.onnx"
+  voices_dir: "voices"
+  voice: "af_heart"
+  speed: 1.0
+  # DirectML on the AMD iGPU intermittently fails Kokoro's ConvTranspose
+  # node (silence instead of speech) — CPU is fast enough and reliable.
+  provider: "cpu"
+
+captions:
+  enabled: false   # desktop notifications not implemented on Windows yet
+
+brain:
+  enabled: true
+  local_url: "http://169.254.83.107:1234/v1"
+  local_model: "google/gemma-4-e4b"
+  kimi_url: "https://api.moonshot.ai/v1"
+  kimi_model: "kimi-k2-0905-preview"
+  kimi_key_file: "kimi-key.txt"   # git-ignored
+  max_tokens: 512                  # replies are spoken — keep them small
+  timeout_sec: 120
+
+logging:
+  level: "info"
+  log_dir: "logs"
+  max_size_mb: 10
+  max_files: 5
