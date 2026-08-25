@@ -182,6 +182,17 @@ pub struct BrainConfig {
     /// Master switch — when false, listen falls back to bridge/orchestrator
     #[serde(default)]
     pub enabled: bool,
+    /// Persona the local model runs: "tutor" or "orchestrator"
+    #[serde(default = "default_persona")]
+    pub persona: String,
+    /// What the tutor teaches (folded into the tutor system prompt)
+    #[serde(default)]
+    pub subject: Option<String>,
+    /// Memory notebook the local model reads (injected each turn) and writes
+    /// (via NOTE: lines). Shared across sessions — this is Five's long-term
+    /// memory of the student / ongoing tasks.
+    #[serde(default)]
+    pub notebook_path: Option<PathBuf>,
     /// LM Studio OpenAI-compatible base URL (no trailing slash)
     #[serde(default = "default_local_url")]
     pub local_url: String,
@@ -211,6 +222,9 @@ impl Default for BrainConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            persona: default_persona(),
+            subject: None,
+            notebook_path: None,
             local_url: default_local_url(),
             local_model: default_local_model(),
             kimi_url: default_kimi_url(),
@@ -220,6 +234,10 @@ impl Default for BrainConfig {
             timeout_sec: default_brain_timeout(),
         }
     }
+}
+
+fn default_persona() -> String {
+    "orchestrator".to_string()
 }
 
 fn default_local_url() -> String {

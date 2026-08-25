@@ -61,6 +61,12 @@ captions:
 
 brain:
   enabled: true
+  # "tutor" or "orchestrator" — both share the tool convention
+  # (NOTE: writes to the notebook, ASK_BIG: escalates to Kimi).
+  persona: "tutor"
+  subject: "whatever the student is curious about"
+  # Long-term memory, re-injected every turn. Edit by hand anytime.
+  notebook_path: "notebook.md"
   local_url: "http://169.254.83.107:1234/v1"
   local_model: "google/gemma-4-e4b"
   kimi_url: "https://api.moonshot.ai/v1"
