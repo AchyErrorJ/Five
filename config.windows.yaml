@@ -7,7 +7,7 @@ audio:
   #                                     # substring match, case-sensitive
   # Windows default output is the Esinkin BT headphones — send replies to
   # the Realtek stereo speakers instead (substring match, case-insensitive).
-  output_device: "Realtek"
+  output_device: "Esinkin"
   target_rate: 16000
   target_channels: 1
   chunk_ms: 100
@@ -53,6 +53,8 @@ voice:
   # DirectML on the AMD iGPU intermittently fails Kokoro's ConvTranspose
   # node (silence instead of speech) — CPU is fast enough and reliable.
   provider: "cpu"
+  # TTS was too quiet over the stereo — 2.0 ≈ +6 dB through a soft limiter.
+  gain: 2.0
 
 captions:
   enabled: false   # desktop notifications not implemented on Windows yet

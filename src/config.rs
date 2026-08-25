@@ -155,6 +155,14 @@ pub struct VoiceConfig {
     /// intermittently fails Kokoro's ConvTranspose node, so Windows = "cpu".
     #[serde(default)]
     pub provider: Option<String>,
+    /// Playback loudness multiplier applied to synthesized samples with a
+    /// soft (tanh) limiter — 1.0 = synthesized level, 2.0 ≈ +6 dB.
+    #[serde(default = "default_gain")]
+    pub gain: f32,
+}
+
+fn default_gain() -> f32 {
+    1.0
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

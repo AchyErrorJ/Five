@@ -25,6 +25,7 @@ pub struct Speaker {
     tts: KokoroTts,
     voice: String,
     speed: f32,
+    gain: f32,
 }
 
 impl Speaker {
@@ -52,7 +53,7 @@ impl Speaker {
             load_ms = start.elapsed().as_millis() as u64,
             "Kokoro TTS loaded"
         );
-        Ok(Self { tts, voice: config.voice.clone(), speed: config.speed })
+        Ok(Self { tts, voice: config.voice.clone(), speed: config.speed, gain: config.gain })
     }
 
     /// Synthesize `text` to 24 kHz mono f32 samples without playing them.
@@ -67,12 +68,24 @@ impl Speaker {
             .synth(text, voice)
             .await
             .map_err(|e| anyhow::anyhow!("TTS synthesis failed: {e}"))?;
+        let mut audio = audio;
+        if (self.gain - 1.0).abs() > f32::EPSILON {
+            apply_gain(&mut audio, self.gain);
+        }
         debug!(
             samples = audio.len(),
             synth_ms = start.elapsed().as_millis() as u64,
             "speech synthesized"
         );
         Ok(audio)
+    }
+}
+
+/// Multiply samples by `gain` through a soft (tanh) limiter: linear below
+/// clipping, saturating smoothly instead of hard-clipping when driven hot.
+fn apply_gain(samples: &mut [f32], gain: f32) {
+    for s in samples.iter_mut() {
+        *s = (*s * gain).tanh();
     }
 }
 
@@ -128,7 +141,71 @@ pub fn play(samples: &[f32], sample_rate: u32) -> anyhow::Result<()> {
 /// only honored on Windows; Linux always uses the ALSA default).
 #[cfg(target_os = "windows")]
 pub fn play_out(samples: &[f32], sample_rate: u32, device: Option<&str>) -> anyhow::Result<()> {
-    play_on(samples, sample_rate, device)
+    // When the target IS the system default device, play through WinMM's
+    // PlaySoundW instead of cpal: the Esinkin BT adapter's driver silently
+    // drops cpal's (event-driven) WASAPI streams while system sounds — which
+    // use this API — work fine. PlaySoundW only renders to the default
+    // device, so non-default targets keep the cpal path.
+    let targets_default = match device {
+        None => true,
+        Some(name) => {
+            use cpal::traits::{DeviceTrait, HostTrait};
+            let needle = name.to_lowercase();
+            cpal::default_host()
+                .default_output_device()
+                .and_then(|d| d.name().ok())
+                .map(|n| n.to_lowercase().contains(&needle))
+                .unwrap_or(false)
+        }
+    };
+    if targets_default {
+        play_via_playsound(samples, sample_rate)
+    } else {
+        play_on(samples, sample_rate, device)
+    }
+}
+
+/// Play mono f32 samples through the Windows default output device via
+/// PlaySoundW (winmm). Builds a WAV in memory and blocks (SND_SYNC) until
+/// done. A 1s silence lead-in lets a sleeping BT receiver wake before speech.
+#[cfg(target_os = "windows")]
+fn play_via_playsound(samples: &[f32], sample_rate: u32) -> anyhow::Result<()> {
+    use std::io::Cursor;
+
+    #[link(name = "winmm")]
+    extern "system" {
+        fn PlaySoundW(psz_sound: *const u16, hmod: *mut core::ffi::c_void, flags: u32) -> i32;
+    }
+    const SND_NODEFAULT: u32 = 0x0002;
+    const SND_MEMORY: u32 = 0x0004;
+    const SND_SYNC: u32 = 0x0000;
+
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut w = hound::WavWriter::new(&mut cursor, spec).context("wav writer")?;
+        // 1s lead-in: the BT receiver swallows the start of playback while
+        // its codec wakes — let it eat silence, not the first word.
+        for _ in 0..sample_rate {
+            w.write_sample(0i16)?;
+        }
+        for &s in samples {
+            w.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
+        }
+        w.finalize().context("wav finalize")?;
+    }
+    let wav = cursor.into_inner();
+    tracing::info!(bytes = wav.len(), "playing audio via PlaySoundW (default device)");
+    let ok = unsafe { PlaySoundW(wav.as_ptr() as *const u16, std::ptr::null_mut(), SND_MEMORY | SND_NODEFAULT | SND_SYNC) };
+    if ok == 0 {
+        anyhow::bail!("PlaySoundW failed to play in-memory wav");
+    }
+    Ok(())
 }
 
 /// Cross-platform playback with optional device selection — Linux ignores
@@ -183,11 +260,14 @@ pub fn play_on(samples: &[f32], sample_rate: u32, device_name: Option<&str>) -> 
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use rubato::{FftFixedIn, Resampler};
 
-    // WASAPI drops the last device-buffer-worth of frames when the stream
-    // closes, clipping the final syllable — pad with 1s of silence so what
-    // gets dropped is padding, not speech.
-    let mut padded = samples.to_vec();
-    padded.resize(samples.len() + sample_rate as usize, 0.0);
+    // Pad both ends with silence:
+    //  - leading 1s: the BT receiver swallows the first ~second of a stream
+    //    while it wakes its codec — let it eat silence, not the first word.
+    //  - trailing 2s: WASAPI drops the last device-buffer-worth of frames on
+    //    stream close — let it drop padding, not the last syllable.
+    let mut padded = vec![0.0; sample_rate as usize];
+    padded.extend_from_slice(samples);
+    padded.resize(padded.len() + 2 * sample_rate as usize, 0.0);
     let samples = &padded[..];
 
     let host = cpal::default_host();
@@ -208,10 +288,28 @@ pub fn play_on(samples: &[f32], sample_rate: u32, device_name: Option<&str>) -> 
             .context("no default output device")?,
     };
     tracing::info!(device = %device.name().unwrap_or_default(), "playing audio");
+    // Prefer 16-bit PCM when the device offers it: some Bluetooth A2DP
+    // drivers advertise f32 in their default config but silently render
+    // nothing for float streams (Realtek handles f32 fine, the Esinkin
+    // adapter doesn't). 16-bit is what system sounds use, and those work.
     let supported = device
-        .default_output_config()
-        .context("failed to query default output config")?;
+        .supported_output_configs()
+        .ok()
+        .and_then(|mut it| it.find(|c| c.sample_format() == cpal::SampleFormat::I16))
+        .map(|c| c.with_max_sample_rate())
+        .unwrap_or_else(|| {
+            device
+                .default_output_config()
+                .expect("failed to query default output config")
+        });
     let stream_config: cpal::StreamConfig = supported.clone().into();
+    tracing::info!(
+        rate = stream_config.sample_rate.0,
+        channels = stream_config.channels,
+        format = ?supported.sample_format(),
+        buffer = ?stream_config.buffer_size,
+        "output stream config"
+    );
 
     let dev_rate = stream_config.sample_rate.0;
     let channels = stream_config.channels as usize;
@@ -265,7 +363,7 @@ pub fn play_on(samples: &[f32], sample_rate: u32, device_name: Option<&str>) -> 
             break;
         }
     }
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    std::thread::sleep(std::time::Duration::from_millis(500));
     drop(stream);
 
     debug!(frames = total, rate = dev_rate, "playback complete");
