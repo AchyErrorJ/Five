@@ -49,7 +49,7 @@ voice:
   model_path: "models/kokoro/model.onnx"
   voices_dir: "voices"
   voice: "af_heart"
-  speed: 1.0
+  speed: 1.1
   # DirectML on the AMD iGPU intermittently fails Kokoro's ConvTranspose
   # node (silence instead of speech) — CPU is fast enough and reliable.
   provider: "cpu"

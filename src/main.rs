@@ -506,16 +506,16 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
     // remainder between chunks.
     let mut pending: Vec<f32> = Vec::with_capacity(frame * 2);
     let mut command: Option<Vec<f32>> = None;
-    // End-of-speech endpointing: finish the command after 1.5s of trailing
+    // End-of-speech endpointing: finish the command after 1s of trailing
     // silence (min 1s of speech) instead of always waiting the full
     // command_duration_sec — a fixed 10s window made every reply feel laggy.
     let min_command = rate; // 1s
-    let silence_limit = rate * 3 / 2; // 1.5s
+    let silence_limit = rate; // 1s
     let mut noise = NoiseFloor::new();
     let mut trailing_silence = 0usize;
     let mut static_diag_counter = 0u32;
     // Text-trigger mode: utterance accumulator (endpointed the same way as
-    // commands — fire after 1.5s of trailing silence, min 0.5s of speech).
+    // commands — fire after 1s of trailing silence, min 0.5s of speech).
     let mut utterance: Vec<f32> = Vec::new();
     let mut speech_total = 0usize;
     // Conversation mode: after a "five" trigger fires, the mic stays hot for

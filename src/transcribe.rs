@@ -63,6 +63,8 @@ impl Transcriber {
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_language(Some("en"));
         params.set_translate(false);
+        // Z1 Extreme: 8 cores — whisper.cpp defaults to 4 threads.
+        params.set_n_threads(8);
         params.set_print_special(false);
         params.set_print_progress(false);
         params.set_print_realtime(false);

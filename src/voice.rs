@@ -167,7 +167,9 @@ pub fn play_out(samples: &[f32], sample_rate: u32, device: Option<&str>) -> anyh
 
 /// Play mono f32 samples through the Windows default output device via
 /// PlaySoundW (winmm). Builds a WAV in memory and blocks (SND_SYNC) until
-/// done. A 1s silence lead-in lets a sleeping BT receiver wake before speech.
+/// done. The silence lead-in lets a sleeping BT receiver wake before speech —
+/// but only when the link is actually cold: if we played through this device
+/// in the last 15s the codec is still awake, so the pad shrinks to 100ms.
 #[cfg(target_os = "windows")]
 fn play_via_playsound(samples: &[f32], sample_rate: u32) -> anyhow::Result<()> {
     use std::io::Cursor;
@@ -179,6 +181,15 @@ fn play_via_playsound(samples: &[f32], sample_rate: u32) -> anyhow::Result<()> {
     const SND_NODEFAULT: u32 = 0x0002;
     const SND_MEMORY: u32 = 0x0004;
     const SND_SYNC: u32 = 0x0000;
+    /// How long the BT codec stays awake after a stream ends (conservative).
+    const BT_WARM_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
+    static LAST_PLAY: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+    let warm = LAST_PLAY
+        .lock()
+        .unwrap()
+        .is_some_and(|t| t.elapsed() < BT_WARM_WINDOW);
+    let lead_in = if warm { sample_rate / 10 } else { sample_rate };
 
     let spec = hound::WavSpec {
         channels: 1,
@@ -189,9 +200,9 @@ fn play_via_playsound(samples: &[f32], sample_rate: u32) -> anyhow::Result<()> {
     let mut cursor = Cursor::new(Vec::new());
     {
         let mut w = hound::WavWriter::new(&mut cursor, spec).context("wav writer")?;
-        // 1s lead-in: the BT receiver swallows the start of playback while
-        // its codec wakes — let it eat silence, not the first word.
-        for _ in 0..sample_rate {
+        // Lead-in: the BT receiver swallows the start of playback while its
+        // codec wakes — let it eat silence, not the first word.
+        for _ in 0..lead_in {
             w.write_sample(0i16)?;
         }
         for &s in samples {
@@ -200,11 +211,12 @@ fn play_via_playsound(samples: &[f32], sample_rate: u32) -> anyhow::Result<()> {
         w.finalize().context("wav finalize")?;
     }
     let wav = cursor.into_inner();
-    tracing::info!(bytes = wav.len(), "playing audio via PlaySoundW (default device)");
+    tracing::info!(bytes = wav.len(), warm, "playing audio via PlaySoundW (default device)");
     let ok = unsafe { PlaySoundW(wav.as_ptr() as *const u16, std::ptr::null_mut(), SND_MEMORY | SND_NODEFAULT | SND_SYNC) };
     if ok == 0 {
         anyhow::bail!("PlaySoundW failed to play in-memory wav");
     }
+    *LAST_PLAY.lock().unwrap() = Some(std::time::Instant::now());
     Ok(())
 }
 
