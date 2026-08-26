@@ -196,31 +196,35 @@ fn local_answer(text: &str) -> Option<String> {
     None
 }
 
-/// Adaptive noise floor for endpointing. The fixed 0.01 RMS silence
-/// threshold never tripped on the Yeti (its idle floor sits higher), so
-/// every utterance ran out to the 10s cap — 9s of whisper per command.
-/// Track a slow EMA of quiet-chunk RMS and call anything under 3x the
-/// floor "silence"; the floor self-calibrates to whatever mic and room
-/// the daemon runs in.
+/// Adaptive noise floor for endpointing. The room is rarely quiet (TV,
+/// the old EMA only drifted UP at 0.1%/chunk toward loud chunks — with the
+/// TV on, the floor stayed low, "silence" never tripped, and every
+/// utterance ran out to the 10s cap (~9s of dead air per command).
+///
+/// Instead, track the *background* level — whatever the room sounds like
+/// right now, TV included — with a fast (~5s) EMA over ALL chunks, and use
+/// hysteresis around it: speech is 4x background, silence is 2x. Constant
+/// TV becomes the floor instead of defeating the endpointing; a person
+/// talking to the mic is far louder than the TV across the room, so their
+/// voice still crosses the speech threshold.
 struct NoiseFloor(f32);
 
 impl NoiseFloor {
     fn new() -> Self {
-        Self(0.01) // seed near the old fixed threshold
+        Self(0.01) // seed near a typical quiet-room floor
     }
-    fn threshold(&self) -> f32 {
-        (self.0 * 3.0).clamp(0.0015, 0.05)
+    /// Fold one chunk's RMS into the background estimate (~5s time constant;
+    /// a 2-4s utterance only nudges it, sustained TV sets it).
+    fn update(&mut self, rms: f32) {
+        self.0 = self.0 * 0.98 + rms * 0.02;
     }
-    /// Returns true when this chunk counts as silence.
-    fn is_silence(&mut self, rms: f32) -> bool {
-        let quiet = rms < self.threshold();
-        if quiet {
-            self.0 = self.0 * 0.95 + rms * 0.05;
-        } else {
-            // loud environment: let the floor drift up slowly
-            self.0 = self.0 * 0.999 + rms.min(0.02) * 0.001;
-        }
-        quiet
+    /// Loud enough to count as speech (someone addressing the mic).
+    fn is_speech(&self, rms: f32) -> bool {
+        rms > (self.0 * 4.0).clamp(0.008, 0.2)
+    }
+    /// Quiet enough to count toward trailing silence (background or below).
+    fn is_silence(&self, rms: f32) -> bool {
+        rms < (self.0 * 2.0).clamp(0.004, 0.1)
     }
 }
 
@@ -290,6 +294,7 @@ fn dispatch_command(
     rt: &tokio::runtime::Runtime,
     captions_enabled: bool,
     device: Option<&str>,
+    ack: &Option<Vec<f32>>,
 ) -> anyhow::Result<()> {
     println!(">> {text}");
     if let Some(path) = bridge {
@@ -310,8 +315,21 @@ fn dispatch_command(
                 reply
             }
             None => {
+                // Instant ack while the brain thinks (3-6s): synthesized once
+                // at startup, so it starts sounding immediately.
+                let acking = ack.as_ref().map(|samples| {
+                    let samples = samples.clone();
+                    let device = device.map(|d| d.to_string());
+                    std::thread::spawn(move || {
+                        let _ = voice::play_out(&samples, voice::TTS_SAMPLE_RATE, device.as_deref());
+                    })
+                });
                 let t0 = std::time::Instant::now();
-                match rt.block_on(brain.respond(text)) {
+                let result = rt.block_on(brain.respond(text));
+                if let Some(h) = acking {
+                    let _ = h.join();
+                }
+                match result {
                     Ok(reply) => {
                         tracing::info!(brain_ms = t0.elapsed().as_millis() as u64, "brain replied");
                         reply
@@ -383,6 +401,14 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
     };
     let capture = audio::AudioCapture::start(&config.audio)?;
     let out_device = config.audio.output_device.as_deref();
+    // Pre-synthesized ack played the instant a command is recognized, while
+    // the brain thinks — fills the 3-6s of dead air the LLM needs. Kept
+    // short so it never outlasts even a fast reply.
+    let ack = if brain.is_some() {
+        rt.block_on(speaker.synthesize("One moment.")).ok()
+    } else {
+        None
+    };
     let text_trigger = !config.wakeword.enabled;
     let mut detector = if text_trigger {
         None
@@ -439,6 +465,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
             } else {
                 trailing_silence = 0;
             }
+            noise.update(rms);
             buf.extend_from_slice(&chunk);
             let endpointed = buf.len() >= min_command && trailing_silence >= silence_limit;
             if buf.len() < command_len && !endpointed {
@@ -460,6 +487,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                         &rt,
                         config.captions.enabled,
                         out_device,
+                        &ack,
                     ) {
                         tracing::error!("dispatch failed: {e:#}");
                     }
@@ -483,12 +511,15 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
         // fire when the text contains the word "five".
         if text_trigger {
             let rms = (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len().max(1) as f32).sqrt();
-            if !noise.is_silence(rms) {
+            if noise.is_speech(rms) {
                 speech_total += chunk.len();
                 trailing_silence = 0;
-            } else {
+            } else if noise.is_silence(rms) {
                 trailing_silence += chunk.len();
             }
+            // Between the two thresholds (hysteresis band): count as neither —
+            // background noise neither extends speech nor ends it.
+            noise.update(rms);
             utterance.extend_from_slice(&chunk);
             let endpointed = speech_total >= rate / 2 && trailing_silence >= silence_limit;
             if utterance.len() < command_len && !endpointed {
@@ -524,6 +555,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                         &rt,
                         config.captions.enabled,
                         out_device,
+                        &ack,
                     ) {
                         tracing::error!("dispatch failed: {e:#}");
                     }
