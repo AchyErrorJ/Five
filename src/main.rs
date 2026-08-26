@@ -306,6 +306,130 @@ fn wants_conversation_end(text: &str) -> bool {
     )
 }
 
+/// A fully pre-computed answer to the predicted follow-up: reply text plus
+/// one synthesized audio buffer per sentence, ready to play instantly.
+struct Speculation {
+    question: String,
+    reply: String,
+    audio: Vec<Vec<f32>>,
+}
+
+/// Speculative follow-up: after each brain reply, predict the next question,
+/// pre-generate and pre-synthesize its answer in a background thread. If the
+/// user's next utterance matches the prediction, it plays with zero brain or
+/// synth latency. `gen` invalidates in-flight work on any new utterance.
+#[derive(Clone)]
+struct SpecCtx {
+    brain: std::sync::Arc<brain::Brain>,
+    speaker: std::sync::Arc<voice::Speaker>,
+    rt: std::sync::Arc<tokio::runtime::Runtime>,
+    store: std::sync::Arc<std::sync::Mutex<Option<Speculation>>>,
+    gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    device: Option<String>,
+}
+
+impl SpecCtx {
+    fn spawn(&self) {
+        let me = self.clone();
+        std::thread::spawn(move || {
+            use std::sync::atomic::Ordering::SeqCst;
+            let my_gen = me.gen.load(SeqCst);
+            let question = match me.rt.block_on(me.brain.predict_followup()) {
+                Ok(Some(q)) => q,
+                Ok(None) => return,
+                Err(e) => {
+                    tracing::warn!("follow-up prediction failed: {e:#}");
+                    return;
+                }
+            };
+            if me.gen.load(SeqCst) != my_gen {
+                return;
+            }
+            let brain = me.brain.clone();
+            let speaker = me.speaker.clone();
+            let q = question.clone();
+            let result = me.rt.block_on(async move {
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+                let producer = brain.respond_stream(&q, tx, false);
+                let consumer = async {
+                    let mut audio = Vec::new();
+                    while let Some(sentence) = rx.recv().await {
+                        audio.push(speaker.synthesize(&sentence).await?);
+                    }
+                    Ok::<Vec<Vec<f32>>, anyhow::Error>(audio)
+                };
+                let (reply, audio) = tokio::join!(producer, consumer);
+                Ok::<(String, Vec<Vec<f32>>), anyhow::Error>((reply?, audio?))
+            });
+            if me.gen.load(SeqCst) != my_gen {
+                return;
+            }
+            match result {
+                Ok((reply, audio)) if !audio.is_empty() => {
+                    tracing::info!(question, "speculative follow-up ready");
+                    *me.store.lock().unwrap() = Some(Speculation { question, reply, audio });
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("speculation failed: {e:#}"),
+            }
+        });
+    }
+
+    /// Invalidate in-flight speculation, then play the buffered answer if the
+    /// utterance matches the prediction. Returns true when it handled the turn.
+    fn try_play(&self, asked: &str) -> bool {
+        self.gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let spec = self.store.lock().unwrap().take();
+        let Some(spec) = spec else { return false };
+        if !spec_matches(asked, &spec.question) {
+            tracing::info!(asked, predicted = spec.question, "speculation missed");
+            return false;
+        }
+        println!("<< (anticipated: {})", spec.question);
+        self.brain.push_history(asked, &spec.reply);
+        let mut playing: Option<std::thread::JoinHandle<()>> = None;
+        for samples in spec.audio {
+            if let Some(h) = playing.take() {
+                let _ = h.join();
+            }
+            let device = self.device.clone();
+            playing = Some(std::thread::spawn(move || {
+                if let Err(e) = voice::play_out(&samples, voice::TTS_SAMPLE_RATE, device.as_deref()) {
+                    tracing::error!("playback failed: {e:#}");
+                }
+            }));
+        }
+        if let Some(h) = playing {
+            let _ = h.join();
+        }
+        true
+    }
+}
+
+/// Word-overlap match between what the user actually asked and the predicted
+/// follow-up: at least 60% of the actual question's content words must appear
+/// in the prediction (the prediction is allowed extra words).
+fn spec_matches(asked: &str, predicted: &str) -> bool {
+    fn words(s: &str) -> Vec<String> {
+        const STOP: &[&str] = &[
+            "the", "and", "for", "you", "your", "what", "how", "why", "does", "can",
+            "could", "would", "that", "this", "with", "about", "tell", "five",
+        ];
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() > 2 && !STOP.contains(w))
+            .map(str::to_string)
+            .collect()
+    }
+    let a = words(asked);
+    if a.is_empty() {
+        return false;
+    }
+    let p: std::collections::HashSet<String> = words(predicted).into_iter().collect();
+    let hits = a.iter().filter(|w| p.contains(*w)).count();
+    hits * 5 >= a.len() * 3
+}
+
 /// Ask the brain and speak the reply as it streams: the brain forwards
 /// each sentence the moment it arrives over SSE, we synthesize and play
 /// them pipelined. First audio lands after sentence one's synth (~1.5s)
@@ -329,7 +453,7 @@ fn ask_and_speak(
     });
     rt.block_on(async {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
-        let producer = brain.respond_stream(text, tx);
+        let producer = brain.respond_stream(text, tx, true);
         let consumer = async {
             let mut playing = acking;
             let mut first = true;
@@ -369,13 +493,14 @@ fn ask_and_speak(
 fn dispatch_command(
     text: &str,
     bridge: &Option<PathBuf>,
-    brain: &Option<brain::Brain>,
+    brain: &Option<std::sync::Arc<brain::Brain>>,
     client: &Option<openclaw::OrchestreClient>,
     speaker: &voice::Speaker,
     rt: &tokio::runtime::Runtime,
     captions_enabled: bool,
     device: Option<&str>,
     ack: &Option<Vec<f32>>,
+    spec: Option<&SpecCtx>,
 ) -> anyhow::Result<()> {
     println!(">> {text}");
     if let Some(path) = bridge {
@@ -410,6 +535,10 @@ fn dispatch_command(
                     Ok(reply) => {
                         tracing::info!(brain_ms = t0.elapsed().as_millis() as u64, "brain replied (streamed)");
                         println!("<< {reply}");
+                        // Pre-compute the likely follow-up while the user listens.
+                        if let Some(s) = spec {
+                            s.spawn();
+                        }
                         return Ok(());
                     }
                     Err(e) => {
@@ -457,18 +586,20 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
     use std::collections::VecDeque;
 
     // Single-threaded runtime for the async pieces (HTTP, TTS synthesis).
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to build listen runtime")?;
+    let rt = std::sync::Arc::new(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build listen runtime")?,
+    );
 
     let transcriber = transcribe::Transcriber::load(&config.transcription)?;
-    let speaker = rt.block_on(voice::Speaker::load(&config.voice))?;
+    let speaker = std::sync::Arc::new(rt.block_on(voice::Speaker::load(&config.voice))?);
     // Routing precedence: bridge file > brain > Orchestre. Bridge mode skips
     // both — commands go to a file for a local Claude Code session, which
     // speaks its own replies.
     let brain = if bridge.is_none() && config.brain.enabled {
-        Some(brain::Brain::new(&config.brain)?)
+        Some(std::sync::Arc::new(brain::Brain::new(&config.brain)?))
     } else {
         None
     };
@@ -479,6 +610,15 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
     };
     let capture = audio::AudioCapture::start(&config.audio)?;
     let out_device = config.audio.output_device.as_deref();
+    // Speculative follow-up context (only when the brain is active).
+    let spec = brain.as_ref().map(|b| SpecCtx {
+        brain: b.clone(),
+        speaker: speaker.clone(),
+        rt: rt.clone(),
+        store: Default::default(),
+        gen: Default::default(),
+        device: out_device.map(str::to_string),
+    });
     // Pre-synthesized ack played the instant a command is recognized, while
     // the brain thinks — fills the 3-6s of dead air the LLM needs. Kept
     // short so it never outlasts even a fast reply.
@@ -519,12 +659,13 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
     let mut utterance: Vec<f32> = Vec::new();
     let mut speech_total = 0usize;
     // Conversation mode: after a "five" trigger fires, the mic stays hot for
-    // 30s — follow-up utterances go straight to dispatch without the wake
-    // word. Every accepted utterance slides the window; "never mind" /
-    // "that's all" / "goodbye" ends it early. Expiry is checked lazily per
-    // utterance, so no timer task is needed.
+    // 5 minutes — follow-up utterances go straight to dispatch without the
+    // wake word. Every accepted utterance slides the window, so an active
+    // conversation never times out; "never mind" / "that's all" / "goodbye"
+    // ends it early. Expiry is checked lazily per utterance, so no timer task
+    // is needed.
     let mut hot_until: Option<std::time::Instant> = None;
-    const HOT_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+    const HOT_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
     // FIVE_DEBUG_SCORES=1 logs every partial detection above a noise floor —
     // for diagnosing "wake word never fires" on the live mic.
     let debug_scores = std::env::var("FIVE_DEBUG_SCORES").is_ok();
@@ -564,6 +705,8 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                     let text = strip_wakeword(&text);
                     if text.is_empty() {
                         println!(">> (nothing recognized)");
+                    } else if spec.as_ref().is_some_and(|s| s.try_play(&text)) {
+                        // Answered from the speculative cache.
                     } else if let Err(e) = dispatch_command(
                         &text,
                         &bridge,
@@ -574,6 +717,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                         config.captions.enabled,
                         out_device,
                         &ack,
+                        spec.as_ref(),
                     ) {
                         tracing::error!("dispatch failed: {e:#}");
                     }
@@ -646,18 +790,21 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
             let hot = hot_until.is_some_and(|t| t > std::time::Instant::now());
             match extract_command(&text) {
                 Some(cmd) if !cmd.is_empty() => {
-                    if let Err(e) = dispatch_command(
-                        &cmd,
-                        &bridge,
-                        &brain,
-                        &client,
-                        &speaker,
-                        &rt,
-                        config.captions.enabled,
-                        out_device,
-                        &ack,
-                    ) {
-                        tracing::error!("dispatch failed: {e:#}");
+                    if !spec.as_ref().is_some_and(|s| s.try_play(&cmd)) {
+                        if let Err(e) = dispatch_command(
+                            &cmd,
+                            &bridge,
+                            &brain,
+                            &client,
+                            &speaker,
+                            &rt,
+                            config.captions.enabled,
+                            out_device,
+                            &ack,
+                            spec.as_ref(),
+                        ) {
+                            tracing::error!("dispatch failed: {e:#}");
+                        }
                     }
                     hot_until = Some(std::time::Instant::now() + HOT_WINDOW);
                     // Drop Five's own reply from the mic queue so it isn't
@@ -680,18 +827,21 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                         }
                     } else {
                         println!(">> (hot) {cmd}");
-                        if let Err(e) = dispatch_command(
-                            cmd,
-                            &bridge,
-                            &brain,
-                            &client,
-                            &speaker,
-                            &rt,
-                            config.captions.enabled,
-                            out_device,
-                            &ack,
-                        ) {
-                            tracing::error!("dispatch failed: {e:#}");
+                        if !spec.as_ref().is_some_and(|s| s.try_play(cmd)) {
+                            if let Err(e) = dispatch_command(
+                                cmd,
+                                &bridge,
+                                &brain,
+                                &client,
+                                &speaker,
+                                &rt,
+                                config.captions.enabled,
+                                out_device,
+                                &ack,
+                                spec.as_ref(),
+                            ) {
+                                tracing::error!("dispatch failed: {e:#}");
+                            }
                         }
                         hot_until = Some(std::time::Instant::now() + HOT_WINDOW);
                     }

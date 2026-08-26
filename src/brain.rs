@@ -257,7 +257,7 @@ impl Brain {
         }
     }
 
-    fn push_history(&self, user: &str, assistant: &str) {
+    pub fn push_history(&self, user: &str, assistant: &str) {
         const MAX_MESSAGES: usize = 16; // ~8 exchanges
         let mut h = self.history.lock().unwrap();
         h.push(Message { role: "user".into(), content: user.into() });
@@ -363,6 +363,33 @@ impl Brain {
         Ok(reply)
     }
 
+    /// Guess the student's most likely follow-up question (one cheap local
+    /// call). Used to pre-generate a speculative reply while the mic is hot;
+    /// never touches history or the notebook itself.
+    pub async fn predict_followup(&self) -> anyhow::Result<Option<String>> {
+        let history = self.history.lock().unwrap().clone();
+        if history.is_empty() {
+            return Ok(None);
+        }
+        let mut messages = vec![Message { role: "system".into(), content: self.system_prompt() }];
+        messages.extend(history);
+        messages.push(Message {
+            role: "user".into(),
+            content: "In one short line, guess the most likely follow-up question the \
+                      student asks next. Reply with ONLY that question — no preamble, \
+                      no explanation."
+                .into(),
+        });
+        let raw = self
+            .chat(&self.cfg.local_url, &self.cfg.local_model, messages, None, true)
+            .await?;
+        let q = raw.trim().trim_matches('"').lines().next().unwrap_or("").trim().to_string();
+        if q.len() < 8 || q.len() > 200 {
+            return Ok(None);
+        }
+        Ok(Some(q))
+    }
+
     /// Clear the rolling conversation history (the "clear context" command).
     /// The notebook is untouched — that's long-term memory, cleared by hand.
     pub fn clear_history(&self) {
@@ -376,14 +403,19 @@ impl Brain {
     /// (NOTE appended immediately; ASK_BIG answered after the stream ends,
     /// its answer forwarded as sentences too). Returns the full spoken
     /// reply (for the log line and history).
+    /// `record: false` runs it speculatively — no history push, no notebook
+    /// writes — so a wrong guess leaves no trace in the conversation.
     pub async fn respond_stream(
         &self,
         text: &str,
         out: tokio::sync::mpsc::Sender<String>,
+        record: bool,
     ) -> anyhow::Result<String> {
         if classify(text) == Route::Kimi {
             let reply = self.ask_big(text).await?;
-            self.push_history(text, &reply);
+            if record {
+                self.push_history(text, &reply);
+            }
             let _ = out.send(reply.clone()).await;
             return Ok(reply);
         }
@@ -443,7 +475,7 @@ impl Brain {
                 while let Some(le) = line_buf.find('\n') {
                     let line = line_buf[..le].trim().to_string();
                     line_buf.drain(..=le);
-                    self.handle_stream_line(&line, &mut speech_buf, &mut escalation);
+                    self.handle_stream_line(&line, &mut speech_buf, &mut escalation, record);
                 }
                 // Complete spoken sentences can go straight to TTS.
                 self.drain_sentences(&mut speech_buf, &out, &mut spoken, false).await;
@@ -452,7 +484,7 @@ impl Brain {
         // Flush: last line without a trailing newline, then the last clause.
         let tail = line_buf.trim().to_string();
         if !tail.is_empty() {
-            self.handle_stream_line(&tail, &mut speech_buf, &mut escalation);
+            self.handle_stream_line(&tail, &mut speech_buf, &mut escalation, record);
         }
         self.drain_sentences(&mut speech_buf, &out, &mut spoken, true).await;
 
@@ -473,18 +505,21 @@ impl Brain {
         } else {
             spoken.join(" ")
         };
-        self.push_history(text, &reply);
+        if record {
+            self.push_history(text, &reply);
+        }
         Ok(reply)
     }
 
     /// Route one completed line of model output: tool lines to their
-    /// handlers, spoken lines into the speech buffer.
-    fn handle_stream_line(&self, line: &str, speech_buf: &mut String, escalation: &mut Option<String>) {
+    /// handlers, spoken lines into the speech buffer. With `record: false`
+    /// (speculation), NOTE lines are dropped instead of written.
+    fn handle_stream_line(&self, line: &str, speech_buf: &mut String, escalation: &mut Option<String>, record: bool) {
         if line.is_empty() {
             return;
         }
         if let Some(rest) = strip_prefix_ci(line, "note:") {
-            if !rest.is_empty() {
+            if record && !rest.is_empty() {
                 self.append_notes(&[rest.to_string()]);
             }
         } else if let Some(rest) = strip_prefix_ci(line, "ask_big:") {
