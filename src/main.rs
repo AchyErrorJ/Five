@@ -283,6 +283,87 @@ fn say_streamed(
     Ok(())
 }
 
+/// Deterministic "clear context" command: wipes the brain's rolling
+/// conversation history (the notebook — long-term memory — stays).
+fn wants_context_clear(text: &str) -> bool {
+    let t = text.to_lowercase();
+    t.contains("clear context")
+        || t.contains("clear your context")
+        || t.contains("new conversation")
+        || t.contains("forget this conversation")
+        || t.contains("forget everything we talked about")
+}
+
+/// Politeness phrases that end a hot-mic conversation window early.
+fn wants_conversation_end(text: &str) -> bool {
+    let t = text.trim().to_lowercase();
+    let t = t.trim_end_matches(['.', '!', '?']);
+    matches!(
+        t,
+        "never mind" | "nevermind" | "that's all" | "thats all" | "that is all"
+            | "goodbye" | "good bye" | "bye" | "stop listening" | "thanks five"
+            | "thank you five" | "thanks" | "thank you"
+    )
+}
+
+/// Ask the brain and speak the reply as it streams: the brain forwards
+/// each sentence the moment it arrives over SSE, we synthesize and play
+/// them pipelined. First audio lands after sentence one's synth (~1.5s)
+/// instead of after the whole reply generates. Returns the full reply.
+fn ask_and_speak(
+    brain: &brain::Brain,
+    speaker: &voice::Speaker,
+    rt: &tokio::runtime::Runtime,
+    device: Option<&str>,
+    text: &str,
+    ack: &Option<Vec<f32>>,
+) -> anyhow::Result<String> {
+    // Instant ack while the brain spins up — it becomes the first playback
+    // in the pipeline, so sentences queue behind it naturally.
+    let acking = ack.as_ref().map(|samples| {
+        let samples = samples.clone();
+        let device = device.map(|d| d.to_string());
+        std::thread::spawn(move || {
+            let _ = voice::play_out(&samples, voice::TTS_SAMPLE_RATE, device.as_deref());
+        })
+    });
+    rt.block_on(async {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+        let producer = brain.respond_stream(text, tx);
+        let consumer = async {
+            let mut playing = acking;
+            let mut first = true;
+            while let Some(sentence) = rx.recv().await {
+                let t0 = std::time::Instant::now();
+                let samples = speaker.synthesize(&sentence).await?;
+                tracing::info!(
+                    synth_ms = t0.elapsed().as_millis() as u64,
+                    first,
+                    sentence,
+                    "sentence synthesized"
+                );
+                first = false;
+                if let Some(h) = playing.take() {
+                    let _ = h.join();
+                }
+                let device = device.map(|d| d.to_string());
+                playing = Some(std::thread::spawn(move || {
+                    if let Err(e) = voice::play_out(&samples, voice::TTS_SAMPLE_RATE, device.as_deref()) {
+                        tracing::error!("playback failed: {e:#}");
+                    }
+                }));
+            }
+            if let Some(h) = playing {
+                let _ = h.join();
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        let (reply, consumed) = tokio::join!(producer, consumer);
+        consumed?;
+        reply
+    })
+}
+
 /// Route one recognized command: append to the bridge file, answer locally
 /// (local 4B / Kimi) and speak its reply, or dispatch to Orchestre.
 fn dispatch_command(
@@ -309,30 +390,27 @@ fn dispatch_command(
         return Ok(());
     }
     if let Some(brain) = brain {
+        if wants_context_clear(text) {
+            brain.clear_history();
+            let reply = "Done. Fresh conversation.";
+            println!("<< {reply}");
+            if let Err(e) = say_streamed(speaker, reply, rt, device) {
+                tracing::error!("speech failed: {e:#}");
+            }
+            return Ok(());
+        }
         let reply = match local_answer(text) {
             Some(reply) => {
                 tracing::info!("answered locally (deterministic command)");
                 reply
             }
             None => {
-                // Instant ack while the brain thinks (3-6s): synthesized once
-                // at startup, so it starts sounding immediately.
-                let acking = ack.as_ref().map(|samples| {
-                    let samples = samples.clone();
-                    let device = device.map(|d| d.to_string());
-                    std::thread::spawn(move || {
-                        let _ = voice::play_out(&samples, voice::TTS_SAMPLE_RATE, device.as_deref());
-                    })
-                });
                 let t0 = std::time::Instant::now();
-                let result = rt.block_on(brain.respond(text));
-                if let Some(h) = acking {
-                    let _ = h.join();
-                }
-                match result {
+                match ask_and_speak(brain, speaker, rt, device, text, ack) {
                     Ok(reply) => {
-                        tracing::info!(brain_ms = t0.elapsed().as_millis() as u64, "brain replied");
-                        reply
+                        tracing::info!(brain_ms = t0.elapsed().as_millis() as u64, "brain replied (streamed)");
+                        println!("<< {reply}");
+                        return Ok(());
                     }
                     Err(e) => {
                         tracing::error!("brain failed: {e:#}");
@@ -435,10 +513,18 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
     let silence_limit = rate * 3 / 2; // 1.5s
     let mut noise = NoiseFloor::new();
     let mut trailing_silence = 0usize;
+    let mut static_diag_counter = 0u32;
     // Text-trigger mode: utterance accumulator (endpointed the same way as
     // commands — fire after 1.5s of trailing silence, min 0.5s of speech).
     let mut utterance: Vec<f32> = Vec::new();
     let mut speech_total = 0usize;
+    // Conversation mode: after a "five" trigger fires, the mic stays hot for
+    // 30s — follow-up utterances go straight to dispatch without the wake
+    // word. Every accepted utterance slides the window; "never mind" /
+    // "that's all" / "goodbye" ends it early. Expiry is checked lazily per
+    // utterance, so no timer task is needed.
+    let mut hot_until: Option<std::time::Instant> = None;
+    const HOT_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
     // FIVE_DEBUG_SCORES=1 logs every partial detection above a noise floor —
     // for diagnosing "wake word never fires" on the live mic.
     let debug_scores = std::env::var("FIVE_DEBUG_SCORES").is_ok();
@@ -511,6 +597,19 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
         // fire when the text contains the word "five".
         if text_trigger {
             let rms = (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len().max(1) as f32).sqrt();
+            // Tuning telemetry: every ~5s, log background floor vs current
+            // level so endpointing thresholds can be set from real data.
+            static_diag_counter += 1;
+            if static_diag_counter >= 50 {
+                static_diag_counter = 0;
+                tracing::info!(
+                    floor = format!("{:.4}", noise.0),
+                    rms = format!("{:.4}", rms),
+                    speech_at = format!("{:.4}", (noise.0 * 4.0).clamp(0.008, 0.2)),
+                    silence_at = format!("{:.4}", (noise.0 * 2.0).clamp(0.004, 0.1)),
+                    "endpointing levels"
+                );
+            }
             if noise.is_speech(rms) {
                 speech_total += chunk.len();
                 trailing_silence = 0;
@@ -544,6 +643,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
             if is_non_speech(&text) {
                 continue;
             }
+            let hot = hot_until.is_some_and(|t| t > std::time::Instant::now());
             match extract_command(&text) {
                 Some(cmd) if !cmd.is_empty() => {
                     if let Err(e) = dispatch_command(
@@ -559,6 +659,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                     ) {
                         tracing::error!("dispatch failed: {e:#}");
                     }
+                    hot_until = Some(std::time::Instant::now() + HOT_WINDOW);
                     // Drop Five's own reply from the mic queue so it isn't
                     // transcribed back as a new utterance.
                     while capture.receiver().try_recv().is_ok() {}
@@ -567,6 +668,33 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                     // Bare "five" with nothing after: record a fresh command.
                     tracing::info!("wake word heard — recording command");
                     command = Some(Vec::with_capacity(command_len));
+                    while capture.receiver().try_recv().is_ok() {}
+                }
+                None if hot => {
+                    let cmd = text.trim();
+                    if wants_conversation_end(cmd) {
+                        hot_until = None;
+                        tracing::info!("conversation ended by user");
+                        if let Err(e) = say_streamed(&speaker, "Okay, going quiet.", &rt, out_device) {
+                            tracing::error!("speech failed: {e:#}");
+                        }
+                    } else {
+                        println!(">> (hot) {cmd}");
+                        if let Err(e) = dispatch_command(
+                            cmd,
+                            &bridge,
+                            &brain,
+                            &client,
+                            &speaker,
+                            &rt,
+                            config.captions.enabled,
+                            out_device,
+                            &ack,
+                        ) {
+                            tracing::error!("dispatch failed: {e:#}");
+                        }
+                        hot_until = Some(std::time::Instant::now() + HOT_WINDOW);
+                    }
                     while capture.receiver().try_recv().is_ok() {}
                 }
                 None => println!(".. (ignored: {})", text.trim()),

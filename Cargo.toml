@@ -8,6 +8,7 @@ description = "Voice assistant daemon for OpenClaw integration"
 [dependencies]
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
+futures-util = "0.3"
 
 # Audio: ALSA on Linux (see HANDOFF.md §2), cpal/WASAPI on Windows
 rubato = "0.15"
@@ -35,7 +36,7 @@ whisper-rs = "0.16"
 hound = "3.5"
 
 # HTTP client (rustls — no system OpenSSL dependency)
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

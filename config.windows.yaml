@@ -65,6 +65,9 @@ brain:
   # (NOTE: writes to the notebook, ASK_BIG: escalates to Kimi).
   persona: "tutor"
   subject: "whatever the student is curious about"
+  # Optional soul file: replaces the built-in persona above with your own
+  # system prompt. Re-read every turn — edit it while Five runs. Uncomment:
+  # soul_path: "soul.md"
   # Long-term memory, re-injected every turn. Edit by hand anytime.
   notebook_path: "notebook.md"
   local_url: "http://169.254.83.107:1234/v1"

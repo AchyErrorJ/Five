@@ -29,6 +29,8 @@ struct ChatRequest {
     messages: Vec<Message>,
     max_tokens: u32,
     temperature: f32,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stream: bool,
     /// LM Studio: "none" turns off gemma/qwen reasoning so the reply lands in
     /// `content` instead of being burned as invisible `reasoning_content`
     /// tokens. Only sent on the local route (Moonshot rejects/ignores it).
@@ -44,6 +46,23 @@ struct ChatResponse {
 #[derive(Deserialize)]
 struct Choice {
     message: Message,
+}
+
+/// One SSE chunk from a streaming completion: choices[0].delta.content.
+#[derive(Deserialize)]
+struct StreamChunk {
+    choices: Vec<StreamChoice>,
+}
+
+#[derive(Deserialize)]
+struct StreamChoice {
+    delta: StreamDelta,
+}
+
+#[derive(Deserialize)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
 }
 
 /// Tool-convention docs shared by both personas.
@@ -176,20 +195,40 @@ impl Brain {
         })
     }
 
-    /// The persona system prompt, with the memory notebook folded in.
-    fn system_prompt(&self) -> String {
-        let persona = match self.cfg.persona.as_str() {
-            "tutor" => {
-                let subject = self.cfg.subject.as_deref().unwrap_or("the student's current subject");
-                format!(
-                    "You are Five, a voice tutor on a handheld PC, teaching {subject}. \
-                    Keep every reply SHORT — spoken aloud, one to three sentences, plain \
-                    speech, no markdown, no lists. Teach step by step: explain briefly, \
-                    then check understanding with one question. Remember where the \
-                    student is and pick up there next session.\n{TOOLS}"
-                )
+    /// Read the soul file, if configured and non-empty. Errors fall back to
+    /// the built-in persona with a warning rather than failing the turn.
+    fn soul(&self) -> Option<String> {
+        let path = self.cfg.soul_path.as_ref()?;
+        match std::fs::read_to_string(path) {
+            Ok(contents) if !contents.trim().is_empty() => Some(contents.trim().to_string()),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!("soul file {} unreadable ({e:#}) — using built-in persona", path.display());
+                None
             }
-            _ => format!("{ORCHESTRATOR_SYSTEM}\n{TOOLS}"),
+        }
+    }
+
+    /// The persona system prompt, with the memory notebook folded in.
+    /// A soul file (brain.soul_path) replaces the built-in persona and is
+    /// re-read every turn, so edits are live; the tool convention is always
+    /// appended so NOTE:/ASK_BIG: keep working regardless of the soul text.
+    fn system_prompt(&self) -> String {
+        let persona = match self.soul() {
+            Some(soul) => format!("{soul}\n{TOOLS}"),
+            None => match self.cfg.persona.as_str() {
+                "tutor" => {
+                    let subject = self.cfg.subject.as_deref().unwrap_or("the student's current subject");
+                    format!(
+                        "You are Five, a voice tutor on a handheld PC, teaching {subject}. \
+                        Keep every reply SHORT — spoken aloud, one to three sentences, plain \
+                        speech, no markdown, no lists. Teach step by step: explain briefly, \
+                        then check understanding with one question. Remember where the \
+                        student is and pick up there next session.\n{TOOLS}"
+                    )
+                }
+                _ => format!("{ORCHESTRATOR_SYSTEM}\n{TOOLS}"),
+            },
         };
         match &self.cfg.notebook_path {
             Some(path) => {
@@ -242,6 +281,7 @@ impl Brain {
             messages,
             max_tokens: self.cfg.max_tokens,
             temperature: 0.7,
+            stream: false,
             reasoning_effort: disable_reasoning.then_some("none"),
         };
         let mut rb = self.http.post(format!("{url}/chat/completions")).json(&req);
@@ -322,6 +362,187 @@ impl Brain {
         self.push_history(text, &reply);
         Ok(reply)
     }
+
+    /// Clear the rolling conversation history (the "clear context" command).
+    /// The notebook is untouched — that's long-term memory, cleared by hand.
+    pub fn clear_history(&self) {
+        self.history.lock().unwrap().clear();
+    }
+
+    /// Streaming variant of `respond`: POSTs the local route with
+    /// stream:true and forwards each complete spoken sentence to `out` the
+    /// moment it arrives, so TTS can synthesize sentence one while the rest
+    /// of the reply is still generating. Tool lines are handled inline
+    /// (NOTE appended immediately; ASK_BIG answered after the stream ends,
+    /// its answer forwarded as sentences too). Returns the full spoken
+    /// reply (for the log line and history).
+    pub async fn respond_stream(
+        &self,
+        text: &str,
+        out: tokio::sync::mpsc::Sender<String>,
+    ) -> anyhow::Result<String> {
+        if classify(text) == Route::Kimi {
+            let reply = self.ask_big(text).await?;
+            self.push_history(text, &reply);
+            let _ = out.send(reply.clone()).await;
+            return Ok(reply);
+        }
+
+        info!(model = %self.cfg.local_model, persona = %self.cfg.persona, "routing to local 4B (streaming)");
+        let mut messages = vec![Message { role: "system".into(), content: self.system_prompt() }];
+        messages.extend(self.history.lock().unwrap().iter().cloned());
+        messages.push(Message { role: "user".into(), content: text.into() });
+
+        let req = ChatRequest {
+            model: self.cfg.local_model.clone(),
+            messages,
+            max_tokens: self.cfg.max_tokens,
+            temperature: 0.7,
+            stream: true,
+            reasoning_effort: Some("none"),
+        };
+        let resp = self
+            .http
+            .post(format!("{}/chat/completions", self.cfg.local_url))
+            .json(&req)
+            .send()
+            .await
+            .context("LLM stream request failed")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("LLM returned {status}: {}", &body[..body.len().min(300)]);
+        }
+
+        // Consume the SSE stream, splitting complete spoken sentences off as
+        // they land. Tool lines are parsed whole (they end with \n).
+        use futures_util::StreamExt;
+        let mut stream = resp.bytes_stream();
+        let mut sse_buf = String::new();   // undecoded SSE bytes
+        let mut line_buf = String::new();  // decoded text, no complete line yet
+        let mut speech_buf = String::new(); // spoken text, no complete sentence yet
+        let mut spoken: Vec<String> = Vec::new();
+        let mut escalation: Option<String> = None;
+
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.context("LLM stream read failed")?;
+            sse_buf.push_str(&String::from_utf8_lossy(&bytes));
+            // SSE events are "data: {...}\n" lines; "data: [DONE]" ends it.
+            while let Some(nl) = sse_buf.find('\n') {
+                let event = sse_buf[..nl].trim_end_matches('\r').to_string();
+                sse_buf.drain(..=nl);
+                let Some(payload) = event.strip_prefix("data: ") else { continue };
+                if payload.trim() == "[DONE]" {
+                    break;
+                }
+                let Ok(chunk) = serde_json::from_str::<StreamChunk>(payload) else { continue };
+                let Some(piece) = chunk.choices.into_iter().next().and_then(|c| c.delta.content) else { continue };
+                line_buf.push_str(&piece);
+
+                // Whole lines: route tool lines, keep spoken lines.
+                while let Some(le) = line_buf.find('\n') {
+                    let line = line_buf[..le].trim().to_string();
+                    line_buf.drain(..=le);
+                    self.handle_stream_line(&line, &mut speech_buf, &mut escalation);
+                }
+                // Complete spoken sentences can go straight to TTS.
+                self.drain_sentences(&mut speech_buf, &out, &mut spoken, false).await;
+            }
+        }
+        // Flush: last line without a trailing newline, then the last clause.
+        let tail = line_buf.trim().to_string();
+        if !tail.is_empty() {
+            self.handle_stream_line(&tail, &mut speech_buf, &mut escalation);
+        }
+        self.drain_sentences(&mut speech_buf, &out, &mut spoken, true).await;
+
+        // Escalation after the local stream: the big model's answer rides
+        // the same sentence channel so it speaks seamlessly after any lead-in.
+        if let Some(question) = escalation {
+            match self.ask_big(&question).await {
+                Ok(big) => {
+                    let mut buf = big;
+                    self.drain_sentences(&mut buf, &out, &mut spoken, true).await;
+                }
+                Err(e) => tracing::error!("escalation failed: {e:#}"),
+            }
+        }
+
+        let reply = if spoken.is_empty() {
+            "I'm not sure what to say to that.".to_string()
+        } else {
+            spoken.join(" ")
+        };
+        self.push_history(text, &reply);
+        Ok(reply)
+    }
+
+    /// Route one completed line of model output: tool lines to their
+    /// handlers, spoken lines into the speech buffer.
+    fn handle_stream_line(&self, line: &str, speech_buf: &mut String, escalation: &mut Option<String>) {
+        if line.is_empty() {
+            return;
+        }
+        if let Some(rest) = strip_prefix_ci(line, "note:") {
+            if !rest.is_empty() {
+                self.append_notes(&[rest.to_string()]);
+            }
+        } else if let Some(rest) = strip_prefix_ci(line, "ask_big:") {
+            if !rest.is_empty() {
+                *escalation = Some(rest.to_string());
+            }
+        } else {
+            if !speech_buf.is_empty() {
+                speech_buf.push(' ');
+            }
+            speech_buf.push_str(line);
+        }
+    }
+
+    /// Cut complete sentences out of `speech_buf` and forward them. With
+    /// `flush`, the trailing fragment goes too (end of reply). Sentences are
+    /// sanitized for speech (no markdown punctuation read aloud).
+    async fn drain_sentences(
+        &self,
+        speech_buf: &mut String,
+        out: &tokio::sync::mpsc::Sender<String>,
+        spoken: &mut Vec<String>,
+        flush: bool,
+    ) {
+        loop {
+            // Sentence ends at . ! ? followed by a space (or at flush, by EOF).
+            let cut = speech_buf.char_indices().find_map(|(i, c)| {
+                if matches!(c, '.' | '!' | '?') && speech_buf[i + c.len_utf8()..].starts_with(' ') {
+                    Some(i + c.len_utf8())
+                } else {
+                    None
+                }
+            });
+            let Some(end) = cut else { break };
+            let sentence: String = speech_buf[..end].trim().to_string();
+            speech_buf.drain(..end);
+            if !sentence.is_empty() {
+                let clean = sanitize_speech(&sentence);
+                spoken.push(clean.clone());
+                let _ = out.send(clean).await;
+            }
+        }
+        if flush {
+            let rest = speech_buf.trim().to_string();
+            speech_buf.clear();
+            if !rest.is_empty() {
+                let clean = sanitize_speech(&rest);
+                spoken.push(clean.clone());
+                let _ = out.send(clean).await;
+            }
+        }
+    }
+}
+
+/// Strip markdown emphasis from spoken text — 4B models leak it even when
+/// told not to, and "asterisk" is not a word Five should say.
+fn sanitize_speech(s: &str) -> String {
+    s.chars().filter(|c| !matches!(c, '*' | '#' | '`' | '_')).collect()
 }
 
 #[cfg(test)]
@@ -351,5 +572,30 @@ mod tests {
         // case-insensitive, stray whitespace
         let p = parse_tools("  ask_big:   test question  ");
         assert_eq!(p.escalation.as_deref(), Some("test question"));
+    }
+
+    #[test]
+    fn soul_file_overrides_persona() {
+        let dir = std::env::temp_dir().join(format!("five-soul-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let soul_path = dir.join("soul.md");
+        std::fs::write(&soul_path, "You are a pirate tutor. Speak like the sea.").unwrap();
+
+        let mut cfg = crate::config::BrainConfig::default();
+        cfg.soul_path = Some(soul_path);
+        let brain = Brain::new(&cfg).unwrap();
+        let prompt = brain.system_prompt();
+        assert!(prompt.contains("pirate tutor"));
+        // Tool convention always rides along so NOTE:/ASK_BIG: keep working.
+        assert!(prompt.contains("NOTE: "));
+        assert!(!prompt.contains("voice tutor on a handheld PC"));
+
+        // Missing file falls back to the built-in persona.
+        let mut cfg = crate::config::BrainConfig::default();
+        cfg.soul_path = Some(dir.join("does-not-exist.md"));
+        let brain = Brain::new(&cfg).unwrap();
+        assert!(brain.system_prompt().contains("Five"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

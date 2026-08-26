@@ -19,3 +19,4 @@ eval-debug*.txt
 /tmp-eval/
 bridge.txt
 notebook.md
+latency-report.html

@@ -188,6 +188,13 @@ pub struct BrainConfig {
     /// What the tutor teaches (folded into the tutor system prompt)
     #[serde(default)]
     pub subject: Option<String>,
+    /// Optional "soul file": a plain-text system prompt that replaces the
+    /// built-in persona entirely (openclaw-style). Re-read every turn, so
+    /// edits take effect on the next utterance without a restart. The tool
+    /// convention (NOTE:/ASK_BIG:) is appended automatically. Missing or
+    /// empty file = fall back to the built-in persona.
+    #[serde(default)]
+    pub soul_path: Option<PathBuf>,
     /// Memory notebook the local model reads (injected each turn) and writes
     /// (via NOTE: lines). Shared across sessions — this is Five's long-term
     /// memory of the student / ongoing tasks.
@@ -224,6 +231,7 @@ impl Default for BrainConfig {
             enabled: false,
             persona: default_persona(),
             subject: None,
+            soul_path: None,
             notebook_path: None,
             local_url: default_local_url(),
             local_model: default_local_model(),
