@@ -295,7 +295,29 @@ fn wants_context_clear(text: &str) -> bool {
         || t.contains("forget everything we talked about")
 }
 
-/// Politeness phrases that end a hot-mic conversation window early.
+/// Detect a request to switch brain modes: "switch to dm mode",
+/// "dm mode", "normal mode", "back to normal", etc.
+/// Returns the mode name (empty string for "reset to base / normal").
+fn wants_mode_switch(text: &str) -> Option<String> {
+    let t = text.to_lowercase();
+    // Explicit "switch to X mode"
+    if let Some(rest) = t.strip_prefix("switch to ") {
+        let mode = rest.trim().trim_end_matches(" mode").trim();
+        return Some(mode.to_string());
+    }
+    if let Some(rest) = t.strip_prefix("activate ") {
+        let mode = rest.trim().trim_end_matches(" mode").trim();
+        return Some(mode.to_string());
+    }
+    // Shorthand: "dm mode", "deep think mode"
+    if t == "dm mode" || t == "deep think mode" || t == "deep thinking mode" {
+        return Some("dm".to_string());
+    }
+    if t == "normal mode" || t == "default mode" || t == "back to normal" {
+        return Some("".to_string());
+    }
+    None
+}
 fn wants_conversation_end(text: &str) -> bool {
     let t = text.trim().to_lowercase();
     let t = t.trim_end_matches(['.', '!', '?']);
@@ -516,6 +538,23 @@ fn dispatch_command(
         return Ok(());
     }
     if let Some(brain) = brain {
+        if let Some(mode) = wants_mode_switch(text) {
+            let ok = brain.switch_mode(&mode);
+            let reply = if ok {
+                if mode.is_empty() {
+                    "Back to normal mode.".to_string()
+                } else {
+                    format!("Switched to {} mode.", mode)
+                }
+            } else {
+                format!("I don't know a '{}' mode.", mode)
+            };
+            println!("<< {reply}");
+            if let Err(e) = say_streamed(speaker, &reply, rt, device) {
+                tracing::error!("speech failed: {e:#}");
+            }
+            return Ok(());
+        }
         if wants_context_clear(text) {
             brain.clear_history();
             let reply = "Done. Fresh conversation.";

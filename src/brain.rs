@@ -87,10 +87,6 @@ const ORCHESTRATOR_SYSTEM: &str = "You are Five, a voice orchestrator on a handh
     plain speech, no markdown, no lists. Answer simple things yourself; \
     orchestrate the rest with your tools.";
 
-const KIMI_SYSTEM: &str = "You are the escalation brain behind Five, a voice assistant. \
-    The user asked something the small local model couldn't handle. Your answer \
-    is SPOKEN ALOUD: plain speech, no markdown, no code blocks, four sentences \
-    max. If it's a coding task, summarize what to do rather than reciting code.";
 
 /// Where a command gets routed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +173,8 @@ pub struct Brain {
     history: std::sync::Mutex<Vec<Message>>,
     /// Optional web search tool.
     searcher: Option<crate::search::Searcher>,
+    /// Active mode name (from `cfg.modes`). None = use base config.
+    active_mode: std::sync::Mutex<Option<String>>,
 }
 
 impl Brain {
@@ -214,6 +212,7 @@ impl Brain {
             kimi_key,
             history: std::sync::Mutex::new(Vec::new()),
             searcher,
+            active_mode: std::sync::Mutex::new(None),
         })
     }
 
@@ -231,14 +230,79 @@ impl Brain {
         }
     }
 
+    /// Effective context window: base `context_window` or active mode's override.
+    fn effective_context_window(&self) -> u32 {
+        let mode = self.active_mode.lock().unwrap();
+        match mode.as_deref() {
+            Some(name) => self.cfg.modes.get(name).map(|m| m.context_window).unwrap_or(self.cfg.context_window),
+            None => self.cfg.context_window,
+        }
+    }
+
+    /// Effective max tokens: base or active mode's override.
+    fn effective_max_tokens(&self) -> u32 {
+        let mode = self.active_mode.lock().unwrap();
+        match mode.as_deref() {
+            Some(name) => self.cfg.modes.get(name).map(|m| m.max_tokens).unwrap_or(self.cfg.max_tokens),
+            None => self.cfg.max_tokens,
+        }
+    }
+
+    /// Effective persona: base or active mode's override.
+    fn effective_persona(&self) -> String {
+        let mode = self.active_mode.lock().unwrap();
+        match mode.as_deref() {
+            Some(name) => self.cfg.modes.get(name).map(|m| m.persona.clone()).unwrap_or_else(|| self.cfg.persona.clone()),
+            None => self.cfg.persona.clone(),
+        }
+    }
+
+    /// Effective local model: base or active mode's override.
+    fn effective_local_model(&self) -> String {
+        let mode = self.active_mode.lock().unwrap();
+        match mode.as_deref() {
+            Some(name) => self.cfg.modes.get(name).map(|m| m.local_model.clone()).unwrap_or_else(|| self.cfg.local_model.clone()),
+            None => self.cfg.local_model.clone(),
+        }
+    }
+
+    /// Switch to a named mode (from `cfg.modes`). Clears history so the new
+    /// context window budget isn't polluted by old conversation. Returns
+    /// true if the mode exists.
+    pub fn switch_mode(&self, name: &str) -> bool {
+        if name.is_empty() || self.cfg.modes.contains_key(name) {
+            let mut m = self.active_mode.lock().unwrap();
+            *m = if name.is_empty() { None } else { Some(name.to_string()) };
+            self.clear_history();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Name of the currently active mode, if any.
+    pub fn current_mode(&self) -> Option<String> {
+        self.active_mode.lock().unwrap().clone()
+    }
+
+    /// Max history messages derived from the effective context window.
+    /// Reserves ~1K tokens for system prompt + notebook, ~150 per message.
+    fn max_messages(&self) -> usize {
+        let ctx = self.effective_context_window();
+        let available = ctx.saturating_sub(self.effective_max_tokens()).saturating_sub(1024);
+        let per_message = 150u32;
+        (available / per_message).max(4).min(512) as usize
+    }
+
     /// The persona system prompt, with the memory notebook folded in.
     /// A soul file (brain.soul_path) replaces the built-in persona and is
     /// re-read every turn, so edits are live; the tool convention is always
     /// appended so NOTE:/ASK_BIG: keep working regardless of the soul text.
     fn system_prompt(&self) -> String {
+        let persona_key = self.effective_persona();
         let persona = match self.soul() {
             Some(soul) => format!("{soul}\n{TOOLS}"),
-            None => match self.cfg.persona.as_str() {
+            None => match persona_key.as_str() {
                 "tutor" => {
                     let subject = self.cfg.subject.as_deref().unwrap_or("the student's current subject");
                     format!(
@@ -280,12 +344,12 @@ impl Brain {
     }
 
     pub fn push_history(&self, user: &str, assistant: &str) {
-        const MAX_MESSAGES: usize = 16; // ~8 exchanges
+        let max_msgs = self.max_messages();
         let mut h = self.history.lock().unwrap();
         h.push(Message { role: "user".into(), content: user.into() });
         h.push(Message { role: "assistant".into(), content: assistant.into() });
-        if h.len() > MAX_MESSAGES {
-            let drop = h.len() - MAX_MESSAGES;
+        if h.len() > max_msgs {
+            let drop = h.len() - max_msgs;
             h.drain(..drop);
         }
     }
@@ -301,7 +365,7 @@ impl Brain {
         let req = ChatRequest {
             model: model.to_string(),
             messages,
-            max_tokens: self.cfg.max_tokens,
+            max_tokens: self.effective_max_tokens(),
             temperature: 0.7,
             stream: false,
             reasoning_effort: disable_reasoning.then_some("none"),
@@ -327,18 +391,27 @@ impl Brain {
             .context("LLM returned no content")
     }
 
-    /// Ask Kimi (tier 2) and return its spoken-form answer.
+    /// Ask Kimi (tier 2) with full conversation context so it assumes the
+    /// role of Five's brain — persona, notebook, and history included.
     async fn ask_big(&self, question: &str) -> anyhow::Result<String> {
         let key = self
             .kimi_key
             .as_deref()
             .context("escalation requested but no Kimi API key (kimi_key_file)")?;
-        info!(model = %self.cfg.kimi_model, "escalating to Kimi");
+        info!(model = %self.cfg.kimi_model, "escalating to Kimi with full context");
         debug!("escalation question: {question}");
-        let messages = vec![
-            Message { role: "system".into(), content: KIMI_SYSTEM.into() },
-            Message { role: "user".into(), content: question.into() },
+
+        let mut messages = vec![
+            Message { role: "system".into(), content: self.system_prompt() },
         ];
+        messages.extend(self.history.lock().unwrap().iter().cloned());
+        messages.push(Message {
+            role: "user".into(),
+            content: format!(
+                "{question}\n\n(Your answer will be spoken aloud as Five. Keep it plain speech, no markdown, four sentences max. If it's a coding task, summarize what to do rather than reciting code.)"
+            ),
+        });
+
         self.chat(&self.cfg.kimi_url, &self.cfg.kimi_model, messages, Some(key), false)
             .await
     }
@@ -351,13 +424,13 @@ impl Brain {
             return Ok(reply);
         }
 
-        info!(model = %self.cfg.local_model, persona = %self.cfg.persona, "routing to local 4B");
+        info!(model = %self.effective_local_model(), persona = %self.effective_persona(), "routing to local 4B");
         let mut messages = vec![Message { role: "system".into(), content: self.system_prompt() }];
         messages.extend(self.history.lock().unwrap().iter().cloned());
         messages.push(Message { role: "user".into(), content: text.into() });
 
         let raw = self
-            .chat(&self.cfg.local_url, &self.cfg.local_model, messages, None, true)
+            .chat(&self.cfg.local_url, &self.effective_local_model(), messages, None, true)
             .await?;
         let parsed = parse_tools(&raw);
         self.append_notes(&parsed.notes);
@@ -427,7 +500,7 @@ impl Brain {
                 .into(),
         });
         let raw = self
-            .chat(&self.cfg.local_url, &self.cfg.local_model, messages, None, true)
+            .chat(&self.cfg.local_url, &self.effective_local_model(), messages, None, true)
             .await?;
         let q = raw.trim().trim_matches('"').lines().next().unwrap_or("").trim().to_string();
         if q.len() < 8 || q.len() > 200 {
@@ -466,15 +539,15 @@ impl Brain {
             return Ok(reply);
         }
 
-        info!(model = %self.cfg.local_model, persona = %self.cfg.persona, "routing to local 4B (streaming)");
+        info!(model = %self.effective_local_model(), persona = %self.effective_persona(), "routing to local 4B (streaming)");
         let mut messages = vec![Message { role: "system".into(), content: self.system_prompt() }];
         messages.extend(self.history.lock().unwrap().iter().cloned());
         messages.push(Message { role: "user".into(), content: text.into() });
 
         let req = ChatRequest {
-            model: self.cfg.local_model.clone(),
+            model: self.effective_local_model(),
             messages,
-            max_tokens: self.cfg.max_tokens,
+            max_tokens: self.effective_max_tokens(),
             temperature: 0.7,
             stream: true,
             reasoning_effort: Some("none"),

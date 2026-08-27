@@ -72,11 +72,22 @@ brain:
   notebook_path: "notebook.md"
   local_url: "http://169.254.83.107:1234/v1"
   local_model: "google/gemma-4-e4b"
+  # Context window of the loaded model. History scales proportionally:
+  # 8K -> ~21 messages kept, 32K -> ~85 messages kept.
+  context_window: 8192
   kimi_url: "https://api.moonshot.ai/v1"
   kimi_model: "kimi-k2-0905-preview"
   kimi_key_file: "kimi-key.txt"   # git-ignored
   max_tokens: 512                  # replies are spoken — keep them small
   timeout_sec: 120
+  # Named modes override base settings at runtime via voice command.
+  # "Five, switch to dm mode" activates the dm profile below.
+  modes:
+    dm:
+      context_window: 32768
+      max_tokens: 2048
+      persona: "tutor"
+      local_model: "google/gemma-4-e4b"
 
 logging:
   level: "info"

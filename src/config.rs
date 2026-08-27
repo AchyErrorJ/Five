@@ -219,10 +219,17 @@ pub struct BrainConfig {
     /// config can be committed). None = Kimi route unavailable.
     #[serde(default)]
     pub kimi_key_file: Option<PathBuf>,
-    /// Max completion tokens per reply. NOTE: the user's 16K budget is the
-    /// model's context window; replies are spoken so they stay small.
+    /// Max completion tokens per reply. Replies are spoken so they stay small.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    /// Context window of the local model (e.g. 8192, 32768). The daemon
+    /// uses this to scale how much conversation history it keeps.
+    #[serde(default = "default_context_window")]
+    pub context_window: u32,
+    /// Named brain modes that override base settings at runtime.
+    /// Switch via voice: "Five, switch to dm mode".
+    #[serde(default)]
+    pub modes: std::collections::HashMap<String, BrainMode>,
     /// Request timeout in seconds (local 4B on iGPU can be slow to start)
     #[serde(default = "default_brain_timeout")]
     pub timeout_sec: u64,
@@ -242,6 +249,8 @@ impl Default for BrainConfig {
             kimi_model: default_kimi_model(),
             kimi_key_file: None,
             max_tokens: default_max_tokens(),
+            context_window: default_context_window(),
+            modes: std::collections::HashMap::new(),
             timeout_sec: default_brain_timeout(),
         }
     }
@@ -266,8 +275,27 @@ fn default_kimi_model() -> String {
 fn default_max_tokens() -> u32 {
     512
 }
+fn default_context_window() -> u32 {
+    8192
+}
 fn default_brain_timeout() -> u64 {
     120
+}
+
+/// A named mode that overrides selected brain settings at runtime.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BrainMode {
+    /// Context window for this mode (e.g. 32768 for deep thinking).
+    pub context_window: u32,
+    /// Max completion tokens in this mode.
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+    /// Persona override for this mode.
+    #[serde(default = "default_persona")]
+    pub persona: String,
+    /// Local model id for this mode.
+    #[serde(default = "default_local_model")]
+    pub local_model: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

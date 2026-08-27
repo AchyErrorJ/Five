@@ -47,3 +47,33 @@ logging:
   log_dir: "/tmp/five"
   max_size_mb: 10
   max_files: 5
+
+# Brain / LLM routing configuration.
+# The daemon routes easy questions to a local model (LM Studio, OpenAI-compatible)
+# and escalates hard/coding tasks to Kimi (Moonshot).
+brain:
+  enabled: true
+  local_url: "http://127.0.0.1:1234/v1"
+  local_model: "google/gemma-4-e4b"
+  # Output token budget per reply (spoken replies stay small).
+  max_tokens: 512
+  # Context window of the loaded model. The daemon scales history size
+  # proportionally: 8K -> ~21 messages, 32K -> ~85 messages.
+  context_window: 8192
+  temperature: 0.7
+  persona: "orchestrator"
+  # Optional: path to a soul file that replaces the built-in persona.
+  # soul_path: "persona/soul.md"
+  # Optional: path to a memory notebook (long-term facts, re-injected every turn).
+  # notebook_path: "notebook.md"
+  kimi_api_key: "PASTE_KIMI_KEY_HERE"
+  kimi_base_url: "https://api.moonshot.cn/v1"
+  kimi_model: "kimi-k2p6"
+  # Named modes that override base settings at runtime.
+  # Switch via voice: "Five, switch to dm mode"
+  modes:
+    dm:
+      context_window: 32768
+      max_tokens: 2048
+      persona: "tutor"
+      local_model: "google/gemma-4-e4b"

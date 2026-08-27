@@ -10,14 +10,8 @@ description = "Voice assistant daemon for OpenClaw integration"
 tokio = { version = "1.35", features = ["full"] }
 futures-util = "0.3"
 
-# Audio: ALSA on Linux (see HANDOFF.md §2), cpal/WASAPI on Windows
+# Audio resampling
 rubato = "0.15"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-alsa = "0.9"
-
-[target.'cfg(target_os = "windows")'.dependencies]
-cpal = "0.15"
 
 # Wake word (pure Rust)
 rustpotter = "3"
@@ -64,6 +58,12 @@ urlencoding = "2.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 kokoro-en = "0.1.5"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa = "0.9"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+cpal = "0.15"
 
 [profile.release]
 opt-level = 3
