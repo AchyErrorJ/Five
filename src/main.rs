@@ -3,6 +3,7 @@ mod brain;
 mod captions;
 mod config;
 mod openclaw;
+mod search;
 mod transcribe;
 mod voice;
 mod wakeword;
@@ -599,7 +600,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
     // both — commands go to a file for a local Claude Code session, which
     // speaks its own replies.
     let brain = if bridge.is_none() && config.brain.enabled {
-        Some(std::sync::Arc::new(brain::Brain::new(&config.brain)?))
+        Some(std::sync::Arc::new(brain::Brain::new(&config.brain, &config.search)?))
     } else {
         None
     };

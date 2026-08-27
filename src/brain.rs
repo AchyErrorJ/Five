@@ -66,13 +66,16 @@ struct StreamDelta {
 }
 
 /// Tool-convention docs shared by both personas.
-const TOOLS: &str = "You have two tools, invoked as whole lines in your reply:\n\
+const TOOLS: &str = "You have three tools, invoked as whole lines in your reply:\n\
     - A line starting with \"NOTE: \" writes one fact to your memory notebook \
     (progress, weak spots, plans). Whenever the user tells you their name, \
     goal, or what they struggle with, ALWAYS write a NOTE.\n\
     - A line starting with \"ASK_BIG: \" sends a hard question to a much \
     bigger model; its answer is spoken to the user. When a question is beyond \
     your own knowledge, prefer ASK_BIG over deflecting or guessing.\n\
+    - A line starting with \"SEARCH: \" searches the web and returns a \
+    summary. Use this for facts you don't know, current events, or when \
+    the user asks about something specific on an allowed site.\n\
     These lines are never spoken aloud.\n\
     Example:\n\
     User: I'm Sam and I keep mixing up pointers.\n\
@@ -121,13 +124,15 @@ struct ParsedReply {
     speech: String,
     notes: Vec<String>,
     escalation: Option<String>,
+    search: Option<String>,
 }
 
-/// Split a reply into spoken text and NOTE:/ASK_BIG: tool lines.
+/// Split a reply into spoken text and NOTE:/ASK_BIG:/SEARCH: tool lines.
 fn parse_tools(raw: &str) -> ParsedReply {
     let mut speech = Vec::new();
     let mut notes = Vec::new();
     let mut escalation = None;
+    let mut search = None;
     for line in raw.lines() {
         let t = line.trim();
         if let Some(rest) = strip_prefix_ci(t, "note:") {
@@ -137,6 +142,10 @@ fn parse_tools(raw: &str) -> ParsedReply {
         } else if let Some(rest) = strip_prefix_ci(t, "ask_big:") {
             if !rest.is_empty() {
                 escalation = Some(rest.to_string());
+            }
+        } else if let Some(rest) = strip_prefix_ci(t, "search:") {
+            if !rest.is_empty() {
+                search = Some(rest.to_string());
             }
         } else if !t.is_empty() {
             speech.push(t);
@@ -149,7 +158,7 @@ fn parse_tools(raw: &str) -> ParsedReply {
         .chars()
         .filter(|c| !matches!(c, '*' | '#' | '`' | '_'))
         .collect();
-    ParsedReply { speech, notes, escalation }
+    ParsedReply { speech, notes, escalation, search }
 }
 
 fn strip_prefix_ci<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
@@ -166,10 +175,12 @@ pub struct Brain {
     kimi_key: Option<String>,
     /// Rolling conversation history (user/assistant pairs), capped.
     history: std::sync::Mutex<Vec<Message>>,
+    /// Optional web search tool.
+    searcher: Option<crate::search::Searcher>,
 }
 
 impl Brain {
-    pub fn new(cfg: &crate::config::BrainConfig) -> anyhow::Result<Self> {
+    pub fn new(cfg: &crate::config::BrainConfig, search_cfg: &crate::config::SearchConfig) -> anyhow::Result<Self> {
         let kimi_key = match &cfg.kimi_key_file {
             Some(path) => {
                 let key = std::fs::read_to_string(path)
@@ -185,6 +196,16 @@ impl Brain {
             }
             None => None,
         };
+        let searcher = if search_cfg.enabled {
+            let s = crate::search::Searcher::new(crate::search::SearchConfig {
+                allowed_sites: search_cfg.allowed_sites.clone(),
+                max_results: search_cfg.max_results,
+                timeout_sec: search_cfg.timeout_sec,
+            })?;
+            Some(s)
+        } else {
+            None
+        };
         Ok(Self {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(cfg.timeout_sec))
@@ -192,6 +213,7 @@ impl Brain {
             cfg: cfg.clone(),
             kimi_key,
             history: std::sync::Mutex::new(Vec::new()),
+            searcher,
         })
     }
 
@@ -340,6 +362,23 @@ impl Brain {
         let parsed = parse_tools(&raw);
         self.append_notes(&parsed.notes);
 
+        // Handle SEARCH tool first — may produce speech directly or feed into model
+        let search_reply = if let Some(ref query) = parsed.search {
+            if let Some(ref searcher) = self.searcher {
+                match searcher.search(query).await {
+                    Ok(results) => Some(crate::search::summarize(&results)),
+                    Err(e) => {
+                        tracing::warn!("search failed: {e:#}");
+                        Some("I tried to search but couldn't reach the web.".to_string())
+                    }
+                }
+            } else {
+                Some("Search isn't configured right now.".to_string())
+            }
+        } else {
+            None
+        };
+
         let reply = if let Some(question) = parsed.escalation {
             // Local model punted: any lead-in it gave ("good question, let me
             // check") is spoken, then the big model's answer.
@@ -353,6 +392,13 @@ impl Brain {
                         parsed.speech
                     }
                 }
+            }
+        } else if let Some(search_speech) = search_reply {
+            // Search result available: prepend any lead-in from the model
+            if parsed.speech.is_empty() {
+                search_speech
+            } else {
+                format!("{} {}", parsed.speech, search_speech)
             }
         } else {
             parsed.speech
@@ -455,6 +501,7 @@ impl Brain {
         let mut speech_buf = String::new(); // spoken text, no complete sentence yet
         let mut spoken: Vec<String> = Vec::new();
         let mut escalation: Option<String> = None;
+        let mut search: Option<String> = None;
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.context("LLM stream read failed")?;
@@ -475,7 +522,7 @@ impl Brain {
                 while let Some(le) = line_buf.find('\n') {
                     let line = line_buf[..le].trim().to_string();
                     line_buf.drain(..=le);
-                    self.handle_stream_line(&line, &mut speech_buf, &mut escalation, record);
+                    self.handle_stream_line(&line, &mut speech_buf, &mut escalation, &mut search, record);
                 }
                 // Complete spoken sentences can go straight to TTS.
                 self.drain_sentences(&mut speech_buf, &out, &mut spoken, false).await;
@@ -484,9 +531,31 @@ impl Brain {
         // Flush: last line without a trailing newline, then the last clause.
         let tail = line_buf.trim().to_string();
         if !tail.is_empty() {
-            self.handle_stream_line(&tail, &mut speech_buf, &mut escalation, record);
+            self.handle_stream_line(&tail, &mut speech_buf, &mut escalation, &mut search, record);
         }
         self.drain_sentences(&mut speech_buf, &out, &mut spoken, true).await;
+
+        // Search after the local stream: if the model asked for a web search,
+        // perform it and speak the results.
+        if let Some(query) = search {
+            if let Some(ref searcher) = self.searcher {
+                match searcher.search(&query).await {
+                    Ok(results) => {
+                        let summary = crate::search::summarize(&results);
+                        let mut buf = summary;
+                        self.drain_sentences(&mut buf, &out, &mut spoken, true).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!("search failed: {e:#}");
+                        let mut buf = "I tried to search but couldn't reach the web.".to_string();
+                        self.drain_sentences(&mut buf, &out, &mut spoken, true).await;
+                    }
+                }
+            } else {
+                let mut buf = "Search isn't configured right now.".to_string();
+                self.drain_sentences(&mut buf, &out, &mut spoken, true).await;
+            }
+        }
 
         // Escalation after the local stream: the big model's answer rides
         // the same sentence channel so it speaks seamlessly after any lead-in.
@@ -514,7 +583,7 @@ impl Brain {
     /// Route one completed line of model output: tool lines to their
     /// handlers, spoken lines into the speech buffer. With `record: false`
     /// (speculation), NOTE lines are dropped instead of written.
-    fn handle_stream_line(&self, line: &str, speech_buf: &mut String, escalation: &mut Option<String>, record: bool) {
+    fn handle_stream_line(&self, line: &str, speech_buf: &mut String, escalation: &mut Option<String>, search: &mut Option<String>, record: bool) {
         if line.is_empty() {
             return;
         }
@@ -525,6 +594,10 @@ impl Brain {
         } else if let Some(rest) = strip_prefix_ci(line, "ask_big:") {
             if !rest.is_empty() {
                 *escalation = Some(rest.to_string());
+            }
+        } else if let Some(rest) = strip_prefix_ci(line, "search:") {
+            if !rest.is_empty() {
+                *search = Some(rest.to_string());
             }
         } else {
             if !speech_buf.is_empty() {
@@ -618,7 +691,8 @@ mod tests {
 
         let mut cfg = crate::config::BrainConfig::default();
         cfg.soul_path = Some(soul_path);
-        let brain = Brain::new(&cfg).unwrap();
+        let search_cfg = crate::config::SearchConfig::default();
+        let brain = Brain::new(&cfg, &search_cfg).unwrap();
         let prompt = brain.system_prompt();
         assert!(prompt.contains("pirate tutor"));
         // Tool convention always rides along so NOTE:/ASK_BIG: keep working.
@@ -628,7 +702,7 @@ mod tests {
         // Missing file falls back to the built-in persona.
         let mut cfg = crate::config::BrainConfig::default();
         cfg.soul_path = Some(dir.join("does-not-exist.md"));
-        let brain = Brain::new(&cfg).unwrap();
+        let brain = Brain::new(&cfg, &search_cfg).unwrap();
         assert!(brain.system_prompt().contains("Five"));
 
         std::fs::remove_dir_all(&dir).ok();

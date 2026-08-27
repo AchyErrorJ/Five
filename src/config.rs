@@ -22,6 +22,9 @@ pub struct AppConfig {
     /// LLM routing: local 4B for easy asks, Kimi coding API for the rest
     #[serde(default)]
     pub brain: BrainConfig,
+    /// Web search tool: allowed sites, max results, timeout
+    #[serde(default)]
+    pub search: SearchConfig,
     /// Logging configuration
     pub logging: LoggingConfig,
 }
@@ -277,6 +280,42 @@ pub struct LoggingConfig {
     pub max_size_mb: u64,
     /// Maximum number of log files to keep
     pub max_files: usize,
+}
+
+/// Web search configuration — which sites Five may search.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SearchConfig {
+    /// Enable web search tool
+    #[serde(default)]
+    pub enabled: bool,
+    /// Domains allowed for search results, e.g. ["wikipedia.org", "github.com"].
+    /// Empty = allow all (not recommended).
+    #[serde(default)]
+    pub allowed_sites: Vec<String>,
+    /// Max results to fetch content from (after filtering).
+    #[serde(default = "default_search_max_results")]
+    pub max_results: usize,
+    /// Request timeout for search + fetch.
+    #[serde(default = "default_search_timeout")]
+    pub timeout_sec: u64,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_sites: Vec::new(),
+            max_results: default_search_max_results(),
+            timeout_sec: default_search_timeout(),
+        }
+    }
+}
+
+fn default_search_max_results() -> usize {
+    3
+}
+fn default_search_timeout() -> u64 {
+    15
 }
 
 impl AppConfig {
