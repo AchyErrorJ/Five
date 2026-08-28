@@ -92,3 +92,13 @@ home:
     "office light": "light.office"
     "movie mode": "scene.movie_mode"
     "bedtime": "scene.bedtime"
+
+# Live dashboard — real-time visibility into Five's thinking.
+dashboard:
+  enabled: true
+  port: 8475  # FIVE on T9 keypad
+
+# Voice-driven file creation.
+files:
+  enabled: true
+  creations_dir: "creations"

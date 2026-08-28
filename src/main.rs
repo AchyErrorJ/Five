@@ -2,6 +2,8 @@ mod audio;
 mod brain;
 mod captions;
 mod config;
+mod dashboard;
+mod files;
 mod openclaw;
 mod search;
 mod transcribe;
@@ -593,6 +595,7 @@ fn dispatch_command(
     bridge: &Option<PathBuf>,
     brain: &Option<std::sync::Arc<brain::Brain>>,
     home_client: &Option<std::sync::Arc<home::HomeClient>>,
+    file_mgr: &Option<std::sync::Arc<files::FileManager>>,
     client: &Option<openclaw::OrchestreClient>,
     speaker: &voice::Speaker,
     rt: &tokio::runtime::Runtime,
@@ -600,8 +603,58 @@ fn dispatch_command(
     device: Option<&str>,
     ack: &Option<Vec<f32>>,
     spec: Option<&SpecCtx>,
+    dash: &Option<dashboard::Dashboard>,
 ) -> anyhow::Result<()> {
     println!(">> {text}");
+    if let Some(d) = dash {
+        d.push(dashboard::DashEvent::Utterance {
+            text: text.to_string(),
+            timestamp: chrono::Local::now().to_rfc3339(),
+        });
+    }
+
+    // File creation: deterministic, fast, no LLM needed.
+    if let Some(ref fm) = file_mgr {
+        if let Some((action, filename, content)) = files::parse_file_command(text) {
+            let result = match action {
+                "write_down" => fm.write_down(&content),
+                "save_as" => {
+                    let name = filename.unwrap_or_else(|| "untitled.txt".to_string());
+                    fm.save_as(&name, &content)
+                }
+                "append" => {
+                    let name = filename.unwrap_or_else(|| "untitled.txt".to_string());
+                    fm.append_to(&name, &content)
+                }
+                _ => anyhow::bail!("unknown file action"),
+            };
+            let reply = match result {
+                Ok(path) => {
+                    let msg = format!("Saved to {}.", path.file_name().unwrap_or_default().to_string_lossy());
+                    if let Some(d) = dash {
+                        d.push(dashboard::DashEvent::File {
+                            path: path.display().to_string(),
+                            action: action.to_string(),
+                        });
+                    }
+                    msg
+                }
+                Err(e) => {
+                    let msg = format!("Could not save file: {e:#}");
+                    if let Some(d) = dash {
+                        d.push(dashboard::DashEvent::System { message: msg.clone() });
+                    }
+                    msg
+                }
+            };
+            println!("<< {reply}");
+            if let Err(e) = say_streamed(speaker, &reply, rt, device) {
+                tracing::error!("speech failed: {e:#}");
+            }
+            return Ok(());
+        }
+    }
+
     if let Some(path) = bridge {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -611,6 +664,11 @@ fn dispatch_command(
             .with_context(|| format!("failed to open bridge {}", path.display()))?;
         writeln!(f, "{text}")?;
         println!("<< [bridged to Claude Code]");
+        if let Some(d) = dash {
+            d.push(dashboard::DashEvent::System {
+                message: "Bridged to Claude Code".to_string(),
+            });
+        }
         return Ok(());
     }
     if let Some(brain) = brain {
@@ -643,6 +701,11 @@ fn dispatch_command(
             } else {
                 format!("I don't know a '{}' mode.", mode)
             };
+            if let Some(d) = dash {
+                d.push(dashboard::DashEvent::Mode {
+                    mode: if mode.is_empty() { "normal".to_string() } else { mode.clone() },
+                });
+            }
             println!("<< {reply}");
             if let Err(e) = say_streamed(speaker, &reply, rt, device) {
                 tracing::error!("speech failed: {e:#}");
@@ -652,6 +715,11 @@ fn dispatch_command(
         if wants_context_clear(text) {
             brain.clear_history();
             let reply = "Done. Fresh conversation.";
+            if let Some(d) = dash {
+                d.push(dashboard::DashEvent::System {
+                    message: "Context cleared".to_string(),
+                });
+            }
             println!("<< {reply}");
             if let Err(e) = say_streamed(speaker, reply, rt, device) {
                 tracing::error!("speech failed: {e:#}");
@@ -661,14 +729,32 @@ fn dispatch_command(
         let reply = match local_answer(text, home_client) {
             Some(reply) => {
                 tracing::info!("answered locally (deterministic command)");
+                if let Some(d) = dash {
+                    d.push(dashboard::DashEvent::Thinking {
+                        step: "local".to_string(),
+                        detail: "deterministic command matched".to_string(),
+                    });
+                }
                 reply
             }
             None => {
+                if let Some(d) = dash {
+                    d.push(dashboard::DashEvent::Thinking {
+                        step: "brain".to_string(),
+                        detail: "routing to LLM".to_string(),
+                    });
+                }
                 let t0 = std::time::Instant::now();
                 match ask_and_speak(brain, speaker, rt, device, text, ack) {
                     Ok(reply) => {
                         tracing::info!(brain_ms = t0.elapsed().as_millis() as u64, "brain replied (streamed)");
                         println!("<< {reply}");
+                        if let Some(d) = dash {
+                            d.push(dashboard::DashEvent::Response {
+                                text: reply.clone(),
+                                done: true,
+                            });
+                        }
                         // Pre-compute the likely follow-up while the user listens.
                         if let Some(s) = spec {
                             s.spawn();
@@ -677,11 +763,22 @@ fn dispatch_command(
                     }
                     Err(e) => {
                         tracing::error!("brain failed: {e:#}");
+                        if let Some(d) = dash {
+                            d.push(dashboard::DashEvent::System {
+                                message: format!("Brain error: {e:#}"),
+                            });
+                        }
                         return Ok(());
                     }
                 }
             }
         };
+        if let Some(d) = dash {
+            d.push(dashboard::DashEvent::Response {
+                text: reply.clone(),
+                done: true,
+            });
+        }
         println!("<< {reply}");
         if let Err(e) = say_streamed(speaker, &reply, rt, device) {
             tracing::error!("speech failed: {e:#}");
@@ -739,6 +836,18 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
     };
     let home_client = if !config.home.url.is_empty() && !config.home.token.is_empty() {
         Some(std::sync::Arc::new(home::HomeClient::new(&config.home)?))
+    } else {
+        None
+    };
+    let file_mgr = if config.files.enabled {
+        Some(std::sync::Arc::new(files::FileManager::new(&config.files)?))
+    } else {
+        None
+    };
+    let dash = if config.dashboard.enabled {
+        let d = dashboard::Dashboard::new(config.dashboard.port);
+        d.spawn();
+        Some(d)
     } else {
         None
     };
@@ -851,6 +960,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                         &bridge,
                         &brain,
                         &home_client,
+                        &file_mgr,
                         &client,
                         &speaker,
                         &rt,
@@ -858,6 +968,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                         out_device,
                         &ack,
                         spec.as_ref(),
+                        &dash,
                     ) {
                         tracing::error!("dispatch failed: {e:#}");
                     }
@@ -936,6 +1047,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                             &bridge,
                             &brain,
                             &home_client,
+                            &file_mgr,
                             &client,
                             &speaker,
                             &rt,
@@ -943,6 +1055,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                             out_device,
                             &ack,
                             spec.as_ref(),
+                            &dash,
                         ) {
                             tracing::error!("dispatch failed: {e:#}");
                         }
@@ -974,6 +1087,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                                 &bridge,
                                 &brain,
                                 &home_client,
+                                &file_mgr,
                                 &client,
                                 &speaker,
                                 &rt,
@@ -981,6 +1095,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                                 out_device,
                                 &ack,
                                 spec.as_ref(),
+                                &dash,
                             ) {
                                 tracing::error!("dispatch failed: {e:#}");
                             }

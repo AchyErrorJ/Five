@@ -28,6 +28,12 @@ pub struct AppConfig {
     /// Web search tool: allowed sites, max results, timeout
     #[serde(default)]
     pub search: SearchConfig,
+    /// Live dashboard: HTTP server showing thinking, commands, responses
+    #[serde(default)]
+    pub dashboard: DashboardConfig,
+    /// Voice-driven file creation
+    #[serde(default)]
+    pub files: FilesConfig,
     /// Logging configuration
     pub logging: LoggingConfig,
 }
@@ -379,6 +385,60 @@ fn default_search_max_results() -> usize {
 }
 fn default_search_timeout() -> u64 {
     15
+}
+
+/// Live dashboard configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DashboardConfig {
+    /// Enable the HTTP dashboard
+    #[serde(default = "default_dashboard_enabled")]
+    pub enabled: bool,
+    /// Port to serve the dashboard on
+    #[serde(default = "default_dashboard_port")]
+    pub port: u16,
+}
+
+fn default_dashboard_enabled() -> bool {
+    true
+}
+fn default_dashboard_port() -> u16 {
+    8475 // FIVE on T9 keypad
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_dashboard_enabled(),
+            port: default_dashboard_port(),
+        }
+    }
+}
+
+/// Voice-driven file creation configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FilesConfig {
+    /// Enable file creation via voice
+    #[serde(default = "default_files_enabled")]
+    pub enabled: bool,
+    /// Directory where created files live (safety sandbox)
+    #[serde(default = "default_creations_dir")]
+    pub creations_dir: PathBuf,
+}
+
+fn default_files_enabled() -> bool {
+    true
+}
+fn default_creations_dir() -> PathBuf {
+    PathBuf::from("creations")
+}
+
+impl Default for FilesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_files_enabled(),
+            creations_dir: default_creations_dir(),
+        }
+    }
 }
 
 impl AppConfig {
