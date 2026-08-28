@@ -89,6 +89,17 @@ brain:
       persona: "tutor"
       local_model: "google/gemma-4-e4b"
 
+# Smart home control via Home Assistant. Uncomment and fill in your HA URL
+# and token to enable voice light/scene control.
+#home:
+#  url: "http://homeassistant.local:8123"
+#  token: "YOUR_LONG_LIVED_ACCESS_TOKEN"
+#  devices:
+#    "living room light": "light.living_room"
+#    "bedroom light": "light.bedroom"
+#    "kitchen light": "light.kitchen"
+#    "movie mode": "scene.movie_mode"
+
 logging:
   level: "info"
   log_dir: "logs"

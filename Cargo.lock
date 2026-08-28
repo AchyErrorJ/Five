@@ -907,6 +907,7 @@ dependencies = [
  "half",
  "hound",
  "kokoro-en",
+ "regex",
  "reqwest",
  "rubato 0.15.0",
  "rustpotter",

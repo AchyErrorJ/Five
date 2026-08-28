@@ -6,6 +6,8 @@ mod openclaw;
 mod search;
 mod transcribe;
 mod voice;
+mod home;
+mod manifest;
 mod wakeword;
 
 use anyhow::Context;
@@ -185,16 +187,89 @@ fn extract_command(text: &str) -> Option<String> {
 /// Deterministic local answers for questions an LLM can only hallucinate —
 /// time and date come from the system clock, phrased for speech. Anything
 /// not matched here falls through to the brain/agents.
-fn local_answer(text: &str) -> Option<String> {
+fn local_answer(
+    text: &str,
+    home_client: &Option<std::sync::Arc<home::HomeClient>>,
+) -> Option<String> {
     let t = text.to_lowercase();
     let now = chrono::Local::now();
+
     if t.contains("time") && (t.contains("what") || t.contains("current") || t.contains("tell")) {
         return Some(now.format("It's %-I:%M %p.").to_string());
     }
     if (t.contains("date") || t.contains("day is")) && (t.contains("what") || t.contains("today")) {
         return Some(now.format("It's %A, %B %-d.").to_string());
     }
+
+    if manifest::wants_device_list(&t) {
+        if let Some(ref home) = home_client {
+            let (devices, scenes) = home.list_entities();
+            if devices.is_empty() && scenes.is_empty() {
+                return Some("No devices or scenes configured yet.".to_string());
+            }
+            let mut parts = Vec::new();
+            if !devices.is_empty() {
+                parts.push(format!("Your lights: {}.", natural_list(&devices)));
+            }
+            if !scenes.is_empty() {
+                parts.push(format!("Your scenes: {}.", natural_list(&scenes)));
+            }
+            return Some(parts.join(" "));
+        }
+        return Some("Smart home is not configured.".to_string());
+    }
+
+    if manifest::wants_help(&t) {
+        let (devices, scenes) = home_client
+            .as_ref()
+            .map(|h| h.list_entities())
+            .unwrap_or_default();
+        return Some(manifest_help_text(&devices, &scenes));
+    }
+
     None
+}
+
+/// "a, b, and c" — speakable list.
+fn natural_list(items: &[String]) -> String {
+    match items.len() {
+        0 => String::new(),
+        1 => items[0].clone(),
+        2 => format!("{} and {}", items[0], items[1]),
+        _ => {
+            let all_but_last = items[..items.len() - 1].join(", ");
+            format!("{}, and {}", all_but_last, items.last().unwrap())
+        }
+    }
+}
+
+/// Voice-friendly help text, compressed for speech.
+fn manifest_help_text(devices: &[String], scenes: &[String]) -> String {
+    let mut parts = vec![
+        "Here's what I can do.".to_string(),
+        "General chat: ask me anything.".to_string(),
+        "Modes: say switch to D M mode, or back to normal.".to_string(),
+        "Context: say clear context to start fresh.".to_string(),
+        "Time: ask what time is it.".to_string(),
+    ];
+
+    if !devices.is_empty() {
+        let device_list = natural_list(devices);
+        parts.push(format!(
+            "Lights: turn on or off the {device_list}. \
+             Dim: set the {device_list} to fifty percent. \
+             Color: set the {device_list} to red, blue, or warm.",
+        ));
+    }
+
+    if !scenes.is_empty() {
+        let scene_list = natural_list(scenes);
+        parts.push(format!("Scenes: activate {scene_list}.",));
+    }
+
+    parts.push("Help: say help to hear this again.".to_string());
+
+    parts.join(" ")
 }
 
 /// Adaptive noise floor for endpointing. The room is rarely quiet (TV,
@@ -517,6 +592,7 @@ fn dispatch_command(
     text: &str,
     bridge: &Option<PathBuf>,
     brain: &Option<std::sync::Arc<brain::Brain>>,
+    home_client: &Option<std::sync::Arc<home::HomeClient>>,
     client: &Option<openclaw::OrchestreClient>,
     speaker: &voice::Speaker,
     rt: &tokio::runtime::Runtime,
@@ -538,6 +614,24 @@ fn dispatch_command(
         return Ok(());
     }
     if let Some(brain) = brain {
+        // Home Assistant commands: deterministic, fast, no LLM needed.
+        if let Some(ref home) = home_client {
+            if let Some(cmd) = home::parse_command(text) {
+                match rt.block_on(home.execute(&cmd)) {
+                    Ok(reply) => {
+                        println!("<< {reply}");
+                        if let Err(e) = say_streamed(speaker, &reply, rt, device) {
+                            tracing::error!("speech failed: {e:#}");
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        tracing::warn!("home command failed: {e:#}");
+                        // Fall through to brain — maybe it's a conversation about lights.
+                    }
+                }
+            }
+        }
         if let Some(mode) = wants_mode_switch(text) {
             let ok = brain.switch_mode(&mode);
             let reply = if ok {
@@ -564,7 +658,7 @@ fn dispatch_command(
             }
             return Ok(());
         }
-        let reply = match local_answer(text) {
+        let reply = match local_answer(text, home_client) {
             Some(reply) => {
                 tracing::info!("answered locally (deterministic command)");
                 reply
@@ -640,6 +734,11 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
     // speaks its own replies.
     let brain = if bridge.is_none() && config.brain.enabled {
         Some(std::sync::Arc::new(brain::Brain::new(&config.brain, &config.search)?))
+    } else {
+        None
+    };
+    let home_client = if !config.home.url.is_empty() && !config.home.token.is_empty() {
+        Some(std::sync::Arc::new(home::HomeClient::new(&config.home)?))
     } else {
         None
     };
@@ -751,6 +850,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                         &text,
                         &bridge,
                         &brain,
+                        &home_client,
                         &client,
                         &speaker,
                         &rt,
@@ -835,6 +935,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                             &cmd,
                             &bridge,
                             &brain,
+                            &home_client,
                             &client,
                             &speaker,
                             &rt,
@@ -872,6 +973,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                                 cmd,
                                 &bridge,
                                 &brain,
+                                &home_client,
                                 &client,
                                 &speaker,
                                 &rt,

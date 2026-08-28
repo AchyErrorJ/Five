@@ -77,3 +77,18 @@ brain:
       max_tokens: 2048
       persona: "tutor"
       local_model: "google/gemma-4-e4b"
+
+# Home Assistant integration — smart lights, scenes, switches.
+# Get a Long-Lived Access Token from your HA profile page.
+home:
+  url: "http://homeassistant.local:8123"
+  token: "YOUR_LONG_LIVED_ACCESS_TOKEN"
+  timeout_sec: 10
+  # Friendly name -> HA entity_id. These are the words you say after "Five".
+  devices:
+    "living room light": "light.living_room"
+    "bedroom light": "light.bedroom"
+    "kitchen light": "light.kitchen"
+    "office light": "light.office"
+    "movie mode": "scene.movie_mode"
+    "bedtime": "scene.bedtime"

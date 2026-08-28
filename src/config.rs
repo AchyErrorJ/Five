@@ -22,6 +22,9 @@ pub struct AppConfig {
     /// LLM routing: local 4B for easy asks, Kimi coding API for the rest
     #[serde(default)]
     pub brain: BrainConfig,
+    /// Smart home control via Home Assistant
+    #[serde(default)]
+    pub home: HomeConfig,
     /// Web search tool: allowed sites, max results, timeout
     #[serde(default)]
     pub search: SearchConfig,
@@ -296,6 +299,38 @@ pub struct BrainMode {
     /// Local model id for this mode.
     #[serde(default = "default_local_model")]
     pub local_model: String,
+}
+
+/// Home Assistant API configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HomeConfig {
+    /// Home Assistant base URL (e.g. "http://homeassistant.local:8123")
+    #[serde(default)]
+    pub url: String,
+    /// Long-lived access token from HA profile page.
+    #[serde(default)]
+    pub token: String,
+    /// Friendly name → HA entity_id mappings.
+    #[serde(default)]
+    pub devices: std::collections::HashMap<String, String>,
+    /// Request timeout in seconds.
+    #[serde(default = "default_home_timeout")]
+    pub timeout_sec: u64,
+}
+
+fn default_home_timeout() -> u64 {
+    10
+}
+
+impl Default for HomeConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            token: String::new(),
+            devices: std::collections::HashMap::new(),
+            timeout_sec: default_home_timeout(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
