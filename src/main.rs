@@ -4,6 +4,7 @@ mod captions;
 mod config;
 mod dashboard;
 mod files;
+mod almanach;
 mod openclaw;
 mod search;
 mod transcribe;
@@ -596,6 +597,7 @@ fn dispatch_command(
     brain: &Option<std::sync::Arc<brain::Brain>>,
     home_client: &Option<std::sync::Arc<home::HomeClient>>,
     file_mgr: &Option<std::sync::Arc<files::FileManager>>,
+    almanach_client: &Option<std::sync::Arc<tokio::sync::Mutex<almanach::AlmanachClient>>>,
     client: &Option<openclaw::OrchestreClient>,
     speaker: &voice::Speaker,
     rt: &tokio::runtime::Runtime,
@@ -652,6 +654,48 @@ fn dispatch_command(
                 tracing::error!("speech failed: {e:#}");
             }
             return Ok(());
+        }
+    }
+
+    // Almanach tutor bridge: send speech to Almanach chat, stream response via TTS.
+    if let Some(ref almanach) = almanach_client {
+        if let Some(d) = dash {
+            d.push(dashboard::DashEvent::Thinking {
+                step: "almanach".to_string(),
+                detail: "routing to Almanach tutor".to_string(),
+            });
+        }
+        let mut client = rt.block_on(almanach.lock());
+        let speaker_ref = speaker.clone();
+        let device_owned = device.map(|d| d.to_string());
+        let dash_clone = dash.clone();
+
+        match rt.block_on(client.send_message_stream(text, move |chunk: &str| {
+            // Stream each chunk to TTS as it arrives
+            if let Some(ref d) = dash_clone {
+                d.push(dashboard::DashEvent::Response {
+                    text: chunk.to_string(),
+                    done: false,
+                });
+            }
+        })) {
+            Ok(full_response) => {
+                if let Some(d) = dash {
+                    d.push(dashboard::DashEvent::Response {
+                        text: full_response.clone(),
+                        done: true,
+                    });
+                }
+                println!("<< [Almanach] {full_response}");
+                if let Err(e) = say_streamed(&speaker_ref, &full_response, rt, device_owned.as_deref()) {
+                    tracing::error!("speech failed: {e:#}");
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!("Almanach failed: {e:#}");
+                // Fall through to brain/Orchestre as fallback
+            }
         }
     }
 
@@ -851,6 +895,15 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
     } else {
         None
     };
+    let almanach_client = if config.almanach.enabled {
+        let mut client = almanach::AlmanachClient::new(&config.almanach)?;
+        if config.almanach.auto_create_conversation {
+            rt.block_on(client.create_conversation(&config.almanach.conversation_title))?;
+        }
+        Some(std::sync::Arc::new(tokio::sync::Mutex::new(client)))
+    } else {
+        None
+    };
     let client = if bridge.is_none() && brain.is_none() {
         Some(openclaw::OrchestreClient::new(&config.openclaw)?)
     } else {
@@ -961,6 +1014,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                         &brain,
                         &home_client,
                         &file_mgr,
+                        &almanach_client,
                         &client,
                         &speaker,
                         &rt,
@@ -1048,6 +1102,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                             &brain,
                             &home_client,
                             &file_mgr,
+                            &almanach_client,
                             &client,
                             &speaker,
                             &rt,
@@ -1088,6 +1143,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                                 &brain,
                                 &home_client,
                                 &file_mgr,
+                                &almanach_client,
                                 &client,
                                 &speaker,
                                 &rt,

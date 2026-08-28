@@ -34,6 +34,9 @@ pub struct AppConfig {
     /// Voice-driven file creation
     #[serde(default)]
     pub files: FilesConfig,
+    /// Almanach tutor integration — bidirectional chat bridge
+    #[serde(default)]
+    pub almanach: AlmanachConfig,
     /// Logging configuration
     pub logging: LoggingConfig,
 }
@@ -437,6 +440,59 @@ impl Default for FilesConfig {
         Self {
             enabled: default_files_enabled(),
             creations_dir: default_creations_dir(),
+        }
+    }
+}
+
+/// Almanach tutor integration configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AlmanachConfig {
+    /// Enable Almanach chat bridge
+    #[serde(default)]
+    pub enabled: bool,
+    /// Almanach orchestrator base URL (e.g. "http://127.0.0.1:3000")
+    #[serde(default)]
+    pub url: String,
+    /// Almanach login password (for JWT token)
+    #[serde(default)]
+    pub password: String,
+    /// Username for Almanach (default: "five")
+    #[serde(default = "default_almanach_username")]
+    pub username: String,
+    /// Request timeout in seconds
+    #[serde(default = "default_almanach_timeout")]
+    pub timeout_sec: u64,
+    /// Auto-create a conversation on startup
+    #[serde(default = "default_almanach_auto_create")]
+    pub auto_create_conversation: bool,
+    /// Title for auto-created conversation
+    #[serde(default = "default_almanach_conversation_title")]
+    pub conversation_title: String,
+}
+
+fn default_almanach_username() -> String {
+    "five".to_string()
+}
+fn default_almanach_timeout() -> u64 {
+    30
+}
+fn default_almanach_auto_create() -> bool {
+    true
+}
+fn default_almanach_conversation_title() -> String {
+    "Five Voice Session".to_string()
+}
+
+impl Default for AlmanachConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            password: String::new(),
+            username: default_almanach_username(),
+            timeout_sec: default_almanach_timeout(),
+            auto_create_conversation: default_almanach_auto_create(),
+            conversation_title: default_almanach_conversation_title(),
         }
     }
 }

@@ -98,7 +98,19 @@ dashboard:
   enabled: true
   port: 8475  # FIVE on T9 keypad
 
+# Almanach tutor integration — bidirectional voice chat bridge.
+almanach:
+  enabled: false
+  url: "http://127.0.0.1:3000"
+  password: "almanach_admin_password"
+  username: "five"
+  timeout_sec: 30
+  auto_create_conversation: true
+  conversation_title: "Five Voice Session"
+
 # Voice-driven file creation.
 files:
+  enabled: true
+  creations_dir: "creations"
   enabled: true
   creations_dir: "creations"
