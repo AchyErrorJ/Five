@@ -89,31 +89,46 @@ impl Dashboard {
         Self { tx, port }
     }
 
-    /// Spawn the HTTP server. Returns immediately; server runs in background.
+    /// Spawn the HTTP server. Returns immediately; the server runs in
+    /// background on its own runtime thread (the listen loop's runtime is
+    /// current_thread and only driven during block_on, so it can't host a
+    /// long-lived server).
     pub fn spawn(&self) {
         let tx = self.tx.clone();
         let port = self.port;
-        tokio::spawn(async move {
-            let addr = SocketAddr::from(([127, 0, 0, 1], port));
-            let listener = match TcpListener::bind(addr).await {
-                Ok(l) => l,
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
                 Err(e) => {
-                    tracing::error!("dashboard bind failed on port {}: {}", port, e);
+                    tracing::error!("dashboard runtime failed: {}", e);
                     return;
                 }
             };
-            tracing::info!("dashboard running at http://127.0.0.1:{}", port);
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        let tx = tx.clone();
-                        tokio::spawn(handle_client(stream, tx));
-                    }
+            rt.block_on(async move {
+                let addr = SocketAddr::from(([127, 0, 0, 1], port));
+                let listener = match TcpListener::bind(addr).await {
+                    Ok(l) => l,
                     Err(e) => {
-                        tracing::error!("dashboard accept error: {}", e);
+                        tracing::error!("dashboard bind failed on port {}: {}", port, e);
+                        return;
+                    }
+                };
+                tracing::info!("dashboard running at http://127.0.0.1:{}", port);
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, _)) => {
+                            let tx = tx.clone();
+                            tokio::spawn(handle_client(stream, tx));
+                        }
+                        Err(e) => {
+                            tracing::error!("dashboard accept error: {}", e);
+                        }
                     }
                 }
-            }
+            });
         });
     }
 
