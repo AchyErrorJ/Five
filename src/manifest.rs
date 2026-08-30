@@ -43,6 +43,26 @@ pub fn static_capabilities() -> Vec<Capability> {
             examples: &["what time is it", "what's today's date"],
         },
         Capability {
+            name: "memory",
+            description: "Long-term memory notebook, kept between sessions",
+            examples: &["remember this", "what do you remember about me"],
+        },
+        Capability {
+            name: "search",
+            description: "Web search on whitelisted sites",
+            examples: &["search the web for rust iterators", "look this up"],
+        },
+        Capability {
+            name: "files",
+            description: "Save notes and snippets to files",
+            examples: &["write this down", "save as shopping list", "add to my notes"],
+        },
+        Capability {
+            name: "conversation_mode",
+            description: "Keep talking after the wake word — no need to repeat it",
+            examples: &["five, what is recursion", "...(follow-ups just work)"],
+        },
+        Capability {
             name: "bridge",
             description: "Send command to Claude Code",
             examples: &["bridge this to Claude Code"],

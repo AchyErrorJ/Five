@@ -193,6 +193,8 @@ fn extract_command(text: &str) -> Option<String> {
 fn local_answer(
     text: &str,
     home_client: &Option<std::sync::Arc<home::HomeClient>>,
+    has_files: bool,
+    has_brain: bool,
 ) -> Option<String> {
     let t = text.to_lowercase();
     let now = chrono::Local::now();
@@ -227,7 +229,7 @@ fn local_answer(
             .as_ref()
             .map(|h| h.list_entities())
             .unwrap_or_default();
-        return Some(manifest_help_text(&devices, &scenes));
+        return Some(manifest_help_text(&devices, &scenes, has_files, has_brain));
     }
 
     None
@@ -247,14 +249,24 @@ fn natural_list(items: &[String]) -> String {
 }
 
 /// Voice-friendly help text, compressed for speech.
-fn manifest_help_text(devices: &[String], scenes: &[String]) -> String {
+fn manifest_help_text(devices: &[String], scenes: &[String], has_files: bool, has_brain: bool) -> String {
     let mut parts = vec![
         "Here's what I can do.".to_string(),
         "General chat: ask me anything.".to_string(),
+        "Conversation: after saying five once, just keep talking — I'm still listening.".to_string(),
         "Modes: say switch to D M mode, or back to normal.".to_string(),
         "Context: say clear context to start fresh.".to_string(),
         "Time: ask what time is it.".to_string(),
     ];
+
+    if has_brain {
+        parts.push("Memory: I keep a notebook between sessions, and remember useful facts.".to_string());
+        parts.push("Search: ask me to look something up on the web.".to_string());
+    }
+
+    if has_files {
+        parts.push("Notes: say write this down, or save as, then a filename.".to_string());
+    }
 
     if !devices.is_empty() {
         let device_list = natural_list(devices);
@@ -770,7 +782,7 @@ fn dispatch_command(
             }
             return Ok(());
         }
-        let reply = match local_answer(text, home_client) {
+        let reply = match local_answer(text, home_client, file_mgr.is_some(), true) {
             Some(reply) => {
                 tracing::info!("answered locally (deterministic command)");
                 if let Some(d) = dash {
