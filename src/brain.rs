@@ -12,7 +12,7 @@
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::BrainConfig;
 
@@ -23,7 +23,7 @@ struct Message {
     content: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
@@ -736,13 +736,33 @@ impl Brain {
             stream: true,
             reasoning_effort: Some("none"),
         };
-        let resp = self
-            .http
-            .post(format!("{}/chat/completions", self.cfg.local_url))
-            .json(&req)
-            .send()
-            .await
-            .context("LLM stream request failed")?;
+        // LM Studio occasionally aborts a fresh connection (os error 10053)
+        // when it's still tearing down an abandoned stream (e.g. a cancelled
+        // speculative request). One retry on a fresh connection absorbs it.
+        let mut last_err = None;
+        let resp = {
+            let mut resp = None;
+            for attempt in 0..2 {
+                if attempt > 0 {
+                    warn!("stream request failed; retrying once on a fresh connection");
+                    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                }
+                match self
+                    .http
+                    .post(format!("{}/chat/completions", self.cfg.local_url))
+                    .json(&req)
+                    .send()
+                    .await
+                {
+                    Ok(r) => { resp = Some(r); break; }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            match resp {
+                Some(r) => r,
+                None => return Err(last_err.unwrap()).context("LLM stream request failed"),
+            }
+        };
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();

@@ -78,8 +78,8 @@ brain:
   # Lesson plans: "make a lesson plan for X" asks Kimi to write a plan into
   # this folder; "start the lesson" has the local model teach it step by step.
   lesson_dir: "lessonplans"
-  kimi_url: "https://api.moonshot.ai/v1"
-  kimi_model: "kimi-k2-0905-preview"
+  kimi_url: "https://api.kimi.com/coding/v1"
+  kimi_model: "kimi-for-coding"
   kimi_key_file: "kimi-key.txt"   # git-ignored
   max_tokens: 512                  # replies are spoken — keep them small
   timeout_sec: 120

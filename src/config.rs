@@ -284,10 +284,12 @@ fn default_local_model() -> String {
     "qwen3.5-4b-mp".into()
 }
 fn default_kimi_url() -> String {
-    "https://api.moonshot.ai/v1".into()
+    // Kimi for Coding plan endpoint (OpenAI-compatible). Keys from
+    // platform.moonshot.ai use https://api.moonshot.ai/v1 instead.
+    "https://api.kimi.com/coding/v1".into()
 }
 fn default_kimi_model() -> String {
-    "kimi-k2-0905-preview".into()
+    "kimi-for-coding".into()
 }
 fn default_max_tokens() -> u32 {
     512

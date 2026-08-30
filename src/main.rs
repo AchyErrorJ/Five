@@ -418,10 +418,24 @@ enum LessonCmd {
     End,
 }
 
+/// Drop whisper's leading noise tags — "[clears throat] start the lesson"
+/// should parse as "start the lesson".
+fn strip_leading_noise(t: &str) -> &str {
+    let mut t = t.trim_start();
+    while t.starts_with(['[', '(']) {
+        match t.find([']', ')']) {
+            Some(i) => t = t[i + 1..].trim_start(),
+            None => break,
+        }
+    }
+    t
+}
+
 /// Detect a lesson command: "make a lesson plan for X", "list lessons",
 /// "start the lesson" / "teach me X", "end the lesson".
 fn wants_lesson_command(text: &str) -> Option<LessonCmd> {
-    let t = text.trim().to_lowercase();
+    let lowered = text.trim().to_lowercase();
+    let t = strip_leading_noise(&lowered);
     let t = t.trim_end_matches(['.', '!', '?']);
 
     // End
@@ -450,7 +464,8 @@ fn wants_lesson_command(text: &str) -> Option<LessonCmd> {
         "make", "create", "write", "generate", "build", "draft", "new",
     ];
     const TOPIC_PREPS: &[&str] = &[" for ", " about ", " on "];
-    if t.contains("lesson plan") || t.contains("lesson on") || t.contains("lesson about") {
+    if t.contains("lesson plan") || t.contains("lessons plan") || t.contains("lessonplan")
+        || t.contains("lesson on") || t.contains("lesson about") {
         let looks_like_create = CREATE_VERBS.iter().any(|v| {
             t.starts_with(&format!("{v} ")) || t.starts_with(&format!("{v} me "))
                 || t.starts_with(&format!("{v} a ")) || t.starts_with(&format!("{v} the "))
