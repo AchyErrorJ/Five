@@ -76,6 +76,9 @@ const TOOLS: &str = "You have three tools, invoked as whole lines in your reply:
     - A line starting with \"SEARCH: \" searches the web and returns a \
     summary. Use this for facts you don't know, current events, or when \
     the user asks about something specific on an allowed site.\n\
+    - A line starting with \"PLAN: \" asks the big model to write a lesson \
+    plan on the given topic; the plan is saved and you then teach it step \
+    by step. Use it when the user wants to learn a topic properly.\n\
     These lines are never spoken aloud.\n\
     Example:\n\
     User: I'm Sam and I keep mixing up pointers.\n\
@@ -121,14 +124,16 @@ struct ParsedReply {
     notes: Vec<String>,
     escalation: Option<String>,
     search: Option<String>,
+    plan: Option<String>,
 }
 
-/// Split a reply into spoken text and NOTE:/ASK_BIG:/SEARCH: tool lines.
+/// Split a reply into spoken text and NOTE:/ASK_BIG:/SEARCH:/PLAN: tool lines.
 fn parse_tools(raw: &str) -> ParsedReply {
     let mut speech = Vec::new();
     let mut notes = Vec::new();
     let mut escalation = None;
     let mut search = None;
+    let mut plan = None;
     for line in raw.lines() {
         let t = line.trim();
         if let Some(rest) = strip_prefix_ci(t, "note:") {
@@ -143,6 +148,10 @@ fn parse_tools(raw: &str) -> ParsedReply {
             if !rest.is_empty() {
                 search = Some(rest.to_string());
             }
+        } else if let Some(rest) = strip_prefix_ci(t, "plan:") {
+            if !rest.is_empty() {
+                plan = Some(rest.to_string());
+            }
         } else if !t.is_empty() {
             speech.push(t);
         }
@@ -154,7 +163,7 @@ fn parse_tools(raw: &str) -> ParsedReply {
         .chars()
         .filter(|c| !matches!(c, '*' | '#' | '`' | '_'))
         .collect();
-    ParsedReply { speech, notes, escalation, search }
+    ParsedReply { speech, notes, escalation, search, plan }
 }
 
 fn strip_prefix_ci<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
@@ -175,6 +184,15 @@ pub struct Brain {
     searcher: Option<crate::search::Searcher>,
     /// Active mode name (from `cfg.modes`). None = use base config.
     active_mode: std::sync::Mutex<Option<String>>,
+    /// Lesson plan currently being taught: title + markdown body. Set when
+    /// a plan is authored or loaded; folded into the system prompt so the
+    /// local model administers it section by section.
+    active_lesson: std::sync::Mutex<Option<ActiveLesson>>,
+}
+
+struct ActiveLesson {
+    title: String,
+    body: String,
 }
 
 impl Brain {
@@ -213,6 +231,7 @@ impl Brain {
             history: std::sync::Mutex::new(Vec::new()),
             searcher,
             active_mode: std::sync::Mutex::new(None),
+            active_lesson: std::sync::Mutex::new(None),
         })
     }
 
@@ -285,6 +304,122 @@ impl Brain {
         self.active_mode.lock().unwrap().clone()
     }
 
+    /// Author a lesson plan on `topic` with the big model (Kimi), save it to
+    /// the lesson directory as markdown, and make it the active lesson.
+    /// Returns the plan's title.
+    pub async fn create_lesson_plan(&self, topic: &str) -> anyhow::Result<String> {
+        let key = self
+            .kimi_key
+            .as_deref()
+            .context("lesson plans need the big model — no Kimi API key (kimi_key_file)")?;
+        info!(topic, model = %self.cfg.kimi_model, "authoring lesson plan");
+        let messages = vec![
+            Message {
+                role: "system".into(),
+                content: "You are a curriculum author. Write lesson plans that a voice tutor \
+                          will teach aloud in short sessions. Markdown, no tables, no images."
+                    .into(),
+            },
+            Message {
+                role: "user".into(),
+                content: format!(
+                    "Write a lesson plan for teaching \"{topic}\" to a curious student.\n\
+                     Format:\n\
+                     # <short title>\n\
+                     One-line summary of what the student will learn.\n\
+                     Then 4 to 6 numbered sections. Each section: a heading, 2-3 sentences of \
+                     explanation in plain spoken English, and one \"Check:\" question to verify \
+                     understanding. The whole plan should be teachable aloud in about ten minutes."
+                ),
+            },
+        ];
+        let body = self
+            .chat_budget(&self.cfg.kimi_url, &self.cfg.kimi_model, messages, Some(key), false, 4096)
+            .await?;
+        let title = body
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("# "))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| topic.trim().to_string());
+        std::fs::create_dir_all(&self.cfg.lesson_dir)?;
+        let path = self.cfg.lesson_dir.join(format!("{}.md", slugify(&title)));
+        std::fs::write(&path, &body).with_context(|| format!("failed to write {}", path.display()))?;
+        info!(path = %path.display(), "lesson plan saved");
+        *self.active_lesson.lock().unwrap() = Some(ActiveLesson {
+            title: title.clone(),
+            body,
+        });
+        Ok(title)
+    }
+
+    /// Lesson titles on disk (markdown files in the lesson directory).
+    pub fn list_lessons(&self) -> Vec<String> {
+        let mut out: Vec<String> = std::fs::read_dir(&self.cfg.lesson_dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter_map(|e| {
+                        let p = e.path();
+                        (p.extension().is_some_and(|x| x == "md")).then(|| {
+                            p.file_stem().unwrap_or_default().to_string_lossy().replace('-', " ")
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    /// Load a lesson from disk by (fuzzy) name and make it active. An empty
+    /// name resumes whichever lesson is already active. Returns its title.
+    pub fn load_lesson(&self, name: &str) -> anyhow::Result<String> {
+        let name = name.trim();
+        if name.is_empty() {
+            let lesson = self.active_lesson.lock().unwrap();
+            return lesson
+                .as_ref()
+                .map(|l| l.title.clone())
+                .context("no lesson is loaded — say start lesson, then a topic");
+        }
+        let want = slugify(name);
+        let rd = std::fs::read_dir(&self.cfg.lesson_dir)
+            .with_context(|| format!("lesson folder {} not found", self.cfg.lesson_dir.display()))?;
+        for e in rd.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "md") {
+                let stem = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                if stem.contains(&want) {
+                    let body = std::fs::read_to_string(&p)
+                        .with_context(|| format!("failed to read {}", p.display()))?;
+                    let title = body
+                        .lines()
+                        .find_map(|l| l.trim().strip_prefix("# "))
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| stem.replace('-', " "));
+                    *self.active_lesson.lock().unwrap() = Some(ActiveLesson {
+                        title: title.clone(),
+                        body,
+                    });
+                    self.clear_history(); // start the lesson with a clean slate
+                    return Ok(title);
+                }
+            }
+        }
+        anyhow::bail!("I don't have a lesson called {name}. Say list lessons to see them.")
+    }
+
+    /// Title of the lesson currently being taught, if any.
+    pub fn current_lesson(&self) -> Option<String> {
+        self.active_lesson.lock().unwrap().as_ref().map(|l| l.title.clone())
+    }
+
+    /// Stop teaching the active lesson. Returns false if none was running.
+    pub fn end_lesson(&self) -> bool {
+        self.active_lesson.lock().unwrap().take().is_some()
+    }
+
     /// Max history messages derived from the effective context window.
     /// Reserves ~1K tokens for system prompt + notebook, ~150 per message.
     fn max_messages(&self) -> usize {
@@ -316,7 +451,7 @@ impl Brain {
                 _ => format!("{ORCHESTRATOR_SYSTEM}\n{TOOLS}"),
             },
         };
-        match &self.cfg.notebook_path {
+        let base = match &self.cfg.notebook_path {
             Some(path) => {
                 let contents = std::fs::read_to_string(path).unwrap_or_default();
                 if contents.trim().is_empty() {
@@ -326,6 +461,25 @@ impl Brain {
                 }
             }
             None => persona,
+        };
+        // Active lesson plan rides along: the local model administers it
+        // section by section. Capped so a long plan can't crowd out history.
+        let lesson = self.active_lesson.lock().unwrap();
+        match lesson.as_ref() {
+            Some(l) => {
+                let body: String = l.body.chars().take(6000).collect();
+                format!(
+                    "{base}\n\nYou are currently teaching this lesson plan: \"{}\". \
+                    Walk through it section by section, ONE section at a time. \
+                    Explain the section briefly in your own words, then ask its \
+                    check question. Wait for the student's answer, say whether it \
+                    was right, then move on. Never read the plan verbatim or dump \
+                    multiple sections at once.\n\n{body}",
+                    l.title,
+                    base = base
+                )
+            }
+            None => base,
         }
     }
 
@@ -362,10 +516,25 @@ impl Brain {
         bearer: Option<&str>,
         disable_reasoning: bool,
     ) -> anyhow::Result<String> {
+        self.chat_budget(url, model, messages, bearer, disable_reasoning, self.effective_max_tokens())
+            .await
+    }
+
+    /// `chat` with an explicit completion budget — lesson plans need far
+    /// more than the short spoken-reply cap.
+    async fn chat_budget(
+        &self,
+        url: &str,
+        model: &str,
+        messages: Vec<Message>,
+        bearer: Option<&str>,
+        disable_reasoning: bool,
+        max_tokens: u32,
+    ) -> anyhow::Result<String> {
         let req = ChatRequest {
             model: model.to_string(),
             messages,
-            max_tokens: self.effective_max_tokens(),
+            max_tokens,
             temperature: 0.7,
             stream: false,
             reasoning_effort: disable_reasoning.then_some("none"),
@@ -452,7 +621,22 @@ impl Brain {
             None
         };
 
-        let reply = if let Some(question) = parsed.escalation {
+        let reply = if let Some(topic) = parsed.plan {
+            // The local model asked for a lesson plan: author it with the big
+            // model, then it's loaded as the active lesson automatically.
+            match self.create_lesson_plan(&topic).await {
+                Ok(title) => [parsed.speech, format!("Lesson plan ready: {title}. Say start the lesson when you want to begin.")]
+                    .into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" "),
+                Err(e) => {
+                    tracing::error!("lesson plan failed: {e:#}");
+                    if parsed.speech.is_empty() {
+                        "I couldn't write that lesson plan right now.".to_string()
+                    } else {
+                        parsed.speech
+                    }
+                }
+            }
+        } else if let Some(question) = parsed.escalation {
             // Local model punted: any lead-in it gave ("good question, let me
             // check") is spoken, then the big model's answer.
             match self.ask_big(&question).await {
@@ -575,6 +759,7 @@ impl Brain {
         let mut spoken: Vec<String> = Vec::new();
         let mut escalation: Option<String> = None;
         let mut search: Option<String> = None;
+        let mut plan: Option<String> = None;
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.context("LLM stream read failed")?;
@@ -595,7 +780,7 @@ impl Brain {
                 while let Some(le) = line_buf.find('\n') {
                     let line = line_buf[..le].trim().to_string();
                     line_buf.drain(..=le);
-                    self.handle_stream_line(&line, &mut speech_buf, &mut escalation, &mut search, record);
+                    self.handle_stream_line(&line, &mut speech_buf, &mut escalation, &mut search, &mut plan, record);
                 }
                 // Complete spoken sentences can go straight to TTS.
                 self.drain_sentences(&mut speech_buf, &out, &mut spoken, false).await;
@@ -604,7 +789,7 @@ impl Brain {
         // Flush: last line without a trailing newline, then the last clause.
         let tail = line_buf.trim().to_string();
         if !tail.is_empty() {
-            self.handle_stream_line(&tail, &mut speech_buf, &mut escalation, &mut search, record);
+            self.handle_stream_line(&tail, &mut speech_buf, &mut escalation, &mut search, &mut plan, record);
         }
         self.drain_sentences(&mut speech_buf, &out, &mut spoken, true).await;
 
@@ -628,6 +813,19 @@ impl Brain {
                 let mut buf = "Search isn't configured right now.".to_string();
                 self.drain_sentences(&mut buf, &out, &mut spoken, true).await;
             }
+        }
+
+        // Lesson plan after the local stream: author it with the big model;
+        // it becomes the active lesson, so the next turns teach it.
+        if let Some(topic) = plan {
+            let mut buf = match self.create_lesson_plan(&topic).await {
+                Ok(title) => format!("Lesson plan ready: {title}. Say start the lesson when you want to begin."),
+                Err(e) => {
+                    tracing::error!("lesson plan failed: {e:#}");
+                    "I couldn't write that lesson plan right now.".to_string()
+                }
+            };
+            self.drain_sentences(&mut buf, &out, &mut spoken, true).await;
         }
 
         // Escalation after the local stream: the big model's answer rides
@@ -656,7 +854,7 @@ impl Brain {
     /// Route one completed line of model output: tool lines to their
     /// handlers, spoken lines into the speech buffer. With `record: false`
     /// (speculation), NOTE lines are dropped instead of written.
-    fn handle_stream_line(&self, line: &str, speech_buf: &mut String, escalation: &mut Option<String>, search: &mut Option<String>, record: bool) {
+    fn handle_stream_line(&self, line: &str, speech_buf: &mut String, escalation: &mut Option<String>, search: &mut Option<String>, plan: &mut Option<String>, record: bool) {
         if line.is_empty() {
             return;
         }
@@ -671,6 +869,10 @@ impl Brain {
         } else if let Some(rest) = strip_prefix_ci(line, "search:") {
             if !rest.is_empty() {
                 *search = Some(rest.to_string());
+            }
+        } else if let Some(rest) = strip_prefix_ci(line, "plan:") {
+            if record && !rest.is_empty() {
+                *plan = Some(rest.to_string());
             }
         } else {
             if !speech_buf.is_empty() {
@@ -726,6 +928,24 @@ fn sanitize_speech(s: &str) -> String {
     s.chars().filter(|c| !matches!(c, '*' | '#' | '`' | '_')).collect()
 }
 
+/// "The French Revolution!" -> "the-french-revolution"
+fn slugify(s: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for c in s.trim().chars() {
+        if c.is_alphanumeric() {
+            if dash && !out.is_empty() {
+                out.push('-');
+            }
+            dash = false;
+            out.push(c.to_ascii_lowercase());
+        } else {
+            dash = true;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,6 +973,18 @@ mod tests {
         // case-insensitive, stray whitespace
         let p = parse_tools("  ask_big:   test question  ");
         assert_eq!(p.escalation.as_deref(), Some("test question"));
+
+        // lesson plan tool
+        let p = parse_tools("Great idea!\nPLAN: the french revolution");
+        assert_eq!(p.speech, "Great idea!");
+        assert_eq!(p.plan.as_deref(), Some("the french revolution"));
+    }
+
+    #[test]
+    fn slugify_cases() {
+        assert_eq!(slugify("The French Revolution!"), "the-french-revolution");
+        assert_eq!(slugify("  photosynthesis  "), "photosynthesis");
+        assert_eq!(slugify("C++ pointers"), "c-pointers");
     }
 
     #[test]

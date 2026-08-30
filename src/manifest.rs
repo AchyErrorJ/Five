@@ -53,6 +53,16 @@ pub fn static_capabilities() -> Vec<Capability> {
             examples: &["search the web for rust iterators", "look this up"],
         },
         Capability {
+            name: "lessons",
+            description: "The big model authors a lesson plan, then Five teaches it step by step",
+            examples: &[
+                "make a lesson plan for the french revolution",
+                "start the lesson",
+                "list lessons",
+                "end the lesson",
+            ],
+        },
+        Capability {
             name: "files",
             description: "Save notes and snippets to files",
             examples: &["write this down", "save as shopping list", "add to my notes"],

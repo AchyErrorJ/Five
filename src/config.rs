@@ -238,6 +238,10 @@ pub struct BrainConfig {
     /// uses this to scale how much conversation history it keeps.
     #[serde(default = "default_context_window")]
     pub context_window: u32,
+    /// Directory where lesson plans live (markdown files authored by the big
+    /// model, administered step-by-step by the local model).
+    #[serde(default = "default_lesson_dir")]
+    pub lesson_dir: PathBuf,
     /// Named brain modes that override base settings at runtime.
     /// Switch via voice: "Five, switch to dm mode".
     #[serde(default)]
@@ -262,6 +266,7 @@ impl Default for BrainConfig {
             kimi_key_file: None,
             max_tokens: default_max_tokens(),
             context_window: default_context_window(),
+            lesson_dir: default_lesson_dir(),
             modes: std::collections::HashMap::new(),
             timeout_sec: default_brain_timeout(),
         }
@@ -289,6 +294,9 @@ fn default_max_tokens() -> u32 {
 }
 fn default_context_window() -> u32 {
     8192
+}
+fn default_lesson_dir() -> PathBuf {
+    PathBuf::from("lessonplans")
 }
 fn default_brain_timeout() -> u64 {
     120

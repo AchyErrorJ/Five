@@ -70,11 +70,14 @@ brain:
   # soul_path: "soul.md"
   # Long-term memory, re-injected every turn. Edit by hand anytime.
   notebook_path: "notebook.md"
-  local_url: "http://169.254.83.107:1234/v1"
+  local_url: "http://127.0.0.1:1234/v1"
   local_model: "google/gemma-4-e4b"
   # Context window of the loaded model. History scales proportionally:
   # 8K -> ~21 messages kept, 32K -> ~85 messages kept.
   context_window: 8192
+  # Lesson plans: "make a lesson plan for X" asks Kimi to write a plan into
+  # this folder; "start the lesson" has the local model teach it step by step.
+  lesson_dir: "lessonplans"
   kimi_url: "https://api.moonshot.ai/v1"
   kimi_model: "kimi-k2-0905-preview"
   kimi_key_file: "kimi-key.txt"   # git-ignored

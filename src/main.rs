@@ -262,6 +262,7 @@ fn manifest_help_text(devices: &[String], scenes: &[String], has_files: bool, ha
     if has_brain {
         parts.push("Memory: I keep a notebook between sessions, and remember useful facts.".to_string());
         parts.push("Search: ask me to look something up on the web.".to_string());
+        parts.push("Lessons: say make a lesson plan for, then a topic — then start the lesson, and I'll teach it step by step. Say list lessons or end the lesson anytime.".to_string());
     }
 
     if has_files {
@@ -408,6 +409,97 @@ fn wants_mode_switch(text: &str) -> Option<String> {
     }
     None
 }
+
+/// Lesson plan voice commands, handled deterministically before anything else.
+enum LessonCmd {
+    Create(String),
+    List,
+    Start(String),
+    End,
+}
+
+/// Detect a lesson command: "make a lesson plan for X", "list lessons",
+/// "start the lesson" / "teach me X", "end the lesson".
+fn wants_lesson_command(text: &str) -> Option<LessonCmd> {
+    let t = text.trim().to_lowercase();
+    let t = t.trim_end_matches(['.', '!', '?']);
+
+    // End
+    if matches!(
+        t,
+        "end lesson" | "end the lesson" | "stop lesson" | "stop the lesson"
+            | "drop the lesson" | "finish the lesson" | "lesson over"
+    ) {
+        return Some(LessonCmd::End);
+    }
+
+    // List
+    if t.contains("list lessons")
+        || t.contains("list my lessons")
+        || t.contains("list lesson plans")
+        || t.contains("what lessons")
+        || t.contains("which lessons")
+        || t == "lessons"
+        || t == "my lessons"
+    {
+        return Some(LessonCmd::List);
+    }
+
+    // Create: "<verb> (a|the) lesson plan <prep> <topic>"
+    const CREATE_VERBS: &[&str] = &[
+        "make", "create", "write", "generate", "build", "draft", "new",
+    ];
+    const TOPIC_PREPS: &[&str] = &[" for ", " about ", " on "];
+    if t.contains("lesson plan") || t.contains("lesson on") || t.contains("lesson about") {
+        let looks_like_create = CREATE_VERBS.iter().any(|v| {
+            t.starts_with(&format!("{v} ")) || t.starts_with(&format!("{v} me "))
+                || t.starts_with(&format!("{v} a ")) || t.starts_with(&format!("{v} the "))
+        });
+        if looks_like_create {
+            // Topic is whatever follows the first preposition; fall back to the
+            // tail after "lesson plan"/"lesson".
+            for prep in TOPIC_PREPS {
+                if let Some(idx) = t.find(prep) {
+                    let topic = t[idx + prep.len()..].trim();
+                    if !topic.is_empty() {
+                        return Some(LessonCmd::Create(topic.to_string()));
+                    }
+                }
+            }
+            if let Some(idx) = t.find("lesson") {
+                let topic = t[idx + "lesson".len()..]
+                    .trim_start_matches(" plan")
+                    .trim();
+                if !topic.is_empty() {
+                    return Some(LessonCmd::Create(topic.to_string()));
+                }
+            }
+            return None; // "make a lesson plan" with no topic — let the LLM ask
+        }
+    }
+
+    // Start: "start lesson", "start the lesson on X", "teach me X", "load lesson X"
+    for prefix in ["start the lesson", "start lesson", "start my lesson", "begin the lesson", "begin lesson", "load lesson", "open lesson", "resume lesson", "resume the lesson"] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            let rest = rest
+                .trim()
+                .trim_start_matches("on ")
+                .trim_start_matches("about ")
+                .trim();
+            return Some(LessonCmd::Start(rest.to_string()));
+        }
+    }
+    if let Some(rest) = t.strip_prefix("teach me ") {
+        let rest = rest.trim().trim_start_matches("about ");
+        return Some(LessonCmd::Start(rest.to_string()));
+    }
+    if t == "teach me" || t == "start teaching" || t == "start the lesson" {
+        return Some(LessonCmd::Start(String::new()));
+    }
+
+    None
+}
+
 fn wants_conversation_end(text: &str) -> bool {
     let t = text.trim().to_lowercase();
     let t = t.trim_end_matches(['.', '!', '?']);
@@ -778,6 +870,61 @@ fn dispatch_command(
             }
             println!("<< {reply}");
             if let Err(e) = say_streamed(speaker, reply, rt, device) {
+                tracing::error!("speech failed: {e:#}");
+            }
+            return Ok(());
+        }
+        if let Some(cmd) = wants_lesson_command(text) {
+            let reply = match cmd {
+                LessonCmd::Create(topic) => {
+                    println!("<< authoring lesson plan for \"{topic}\" (Kimi)...");
+                    if let Some(d) = dash {
+                        d.push(dashboard::DashEvent::Thinking {
+                            step: "lesson".to_string(),
+                            detail: format!("authoring plan: {topic}"),
+                        });
+                    }
+                    match rt.block_on(brain.create_lesson_plan(&topic)) {
+                        Ok(title) => {
+                            if let Some(d) = dash {
+                                d.push(dashboard::DashEvent::File {
+                                    path: format!("lessonplans/{}.md", title),
+                                    action: "lesson plan".to_string(),
+                                });
+                            }
+                            format!("Lesson plan ready: {title}. I've saved it and I'm holding it — say start the lesson when you want to begin.")
+                        }
+                        Err(e) => {
+                            tracing::error!("lesson plan failed: {e:#}");
+                            "I couldn't write that lesson plan right now.".to_string()
+                        }
+                    }
+                }
+                LessonCmd::List => {
+                    let lessons = brain.list_lessons();
+                    if lessons.is_empty() {
+                        "No lesson plans yet. Say make a lesson plan for, then a topic.".to_string()
+                    } else {
+                        format!("Your lessons: {}.", natural_list(&lessons))
+                    }
+                }
+                LessonCmd::Start(name) => match brain.load_lesson(&name) {
+                    Ok(title) => format!("Starting {title}. Let's go."),
+                    Err(e) => format!("{e:#}"),
+                },
+                LessonCmd::End => {
+                    if brain.end_lesson() {
+                        "Lesson ended. Back to free chat.".to_string()
+                    } else {
+                        "There's no lesson running.".to_string()
+                    }
+                }
+            };
+            if let Some(d) = dash {
+                d.push(dashboard::DashEvent::Response { text: reply.clone(), done: true });
+            }
+            println!("<< {reply}");
+            if let Err(e) = say_streamed(speaker, &reply, rt, device) {
                 tracing::error!("speech failed: {e:#}");
             }
             return Ok(());
