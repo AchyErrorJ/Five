@@ -251,6 +251,10 @@ pub struct BrainConfig {
     /// tokens count against it, so 512 would starve kimi-for-coding.
     #[serde(default = "default_kimi_max_tokens")]
     pub kimi_max_tokens: u32,
+    /// Timeout for big-model requests. A 64K-token plan with reasoning takes
+    /// minutes — far beyond the 120s default that local replies get.
+    #[serde(default = "default_kimi_timeout")]
+    pub kimi_timeout_sec: u64,
     /// Named brain modes that override base settings at runtime.
     /// Switch via voice: "Five, switch to dm mode".
     #[serde(default)]
@@ -278,6 +282,7 @@ impl Default for BrainConfig {
             lesson_dir: default_lesson_dir(),
             plan_max_tokens: default_plan_max_tokens(),
             kimi_max_tokens: default_kimi_max_tokens(),
+            kimi_timeout_sec: default_kimi_timeout(),
             modes: std::collections::HashMap::new(),
             timeout_sec: default_brain_timeout(),
         }
@@ -316,6 +321,9 @@ fn default_plan_max_tokens() -> u32 {
 }
 fn default_kimi_max_tokens() -> u32 {
     8192
+}
+fn default_kimi_timeout() -> u64 {
+    600
 }
 fn default_brain_timeout() -> u64 {
     120

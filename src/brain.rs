@@ -424,6 +424,7 @@ impl Brain {
                 false,
                 self.cfg.plan_max_tokens,
                 1.0, // kimi-for-coding: "only 1 is allowed for this model"
+                Some(self.cfg.kimi_timeout_sec),
             )
             .await?;
         let title = body
@@ -661,13 +662,14 @@ impl Brain {
         bearer: Option<&str>,
         disable_reasoning: bool,
     ) -> anyhow::Result<String> {
-        self.chat_budget(url, model, messages, bearer, disable_reasoning, self.effective_max_tokens(), 0.7)
+        self.chat_budget(url, model, messages, bearer, disable_reasoning, self.effective_max_tokens(), 0.7, None)
             .await
     }
 
     /// `chat` with an explicit completion budget — lesson plans need far
     /// more than the short spoken-reply cap. `temperature` is per-route:
-    /// kimi-for-coding rejects anything but 1.
+    /// kimi-for-coding rejects anything but 1. `timeout_sec` overrides the
+    /// client default for slow routes (a 64K-token plan takes minutes).
     async fn chat_budget(
         &self,
         url: &str,
@@ -677,6 +679,7 @@ impl Brain {
         disable_reasoning: bool,
         max_tokens: u32,
         temperature: f32,
+        timeout_sec: Option<u64>,
     ) -> anyhow::Result<String> {
         let req = ChatRequest {
             model: model.to_string(),
@@ -687,6 +690,9 @@ impl Brain {
             reasoning_effort: disable_reasoning.then_some("none"),
         };
         let mut rb = self.http.post(format!("{url}/chat/completions")).json(&req);
+        if let Some(t) = timeout_sec {
+            rb = rb.timeout(std::time::Duration::from_secs(t));
+        }
         if let Some(key) = bearer {
             rb = rb.bearer_auth(key);
         }
@@ -728,7 +734,7 @@ impl Brain {
             ),
         });
 
-        self.chat_budget(&self.cfg.kimi_url, &self.cfg.kimi_model, messages, Some(key), false, self.cfg.kimi_max_tokens, 1.0)
+        self.chat_budget(&self.cfg.kimi_url, &self.cfg.kimi_model, messages, Some(key), false, self.cfg.kimi_max_tokens, 1.0, Some(self.cfg.kimi_timeout_sec))
             .await
     }
 
