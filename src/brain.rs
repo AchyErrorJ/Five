@@ -423,6 +423,7 @@ impl Brain {
                 Some(key),
                 false,
                 self.cfg.plan_max_tokens,
+                1.0, // kimi-for-coding: "only 1 is allowed for this model"
             )
             .await?;
         let title = body
@@ -660,12 +661,13 @@ impl Brain {
         bearer: Option<&str>,
         disable_reasoning: bool,
     ) -> anyhow::Result<String> {
-        self.chat_budget(url, model, messages, bearer, disable_reasoning, self.effective_max_tokens())
+        self.chat_budget(url, model, messages, bearer, disable_reasoning, self.effective_max_tokens(), 0.7)
             .await
     }
 
     /// `chat` with an explicit completion budget — lesson plans need far
-    /// more than the short spoken-reply cap.
+    /// more than the short spoken-reply cap. `temperature` is per-route:
+    /// kimi-for-coding rejects anything but 1.
     async fn chat_budget(
         &self,
         url: &str,
@@ -674,12 +676,13 @@ impl Brain {
         bearer: Option<&str>,
         disable_reasoning: bool,
         max_tokens: u32,
+        temperature: f32,
     ) -> anyhow::Result<String> {
         let req = ChatRequest {
             model: model.to_string(),
             messages,
             max_tokens,
-            temperature: 0.7,
+            temperature,
             stream: false,
             reasoning_effort: disable_reasoning.then_some("none"),
         };
@@ -725,7 +728,7 @@ impl Brain {
             ),
         });
 
-        self.chat_budget(&self.cfg.kimi_url, &self.cfg.kimi_model, messages, Some(key), false, self.cfg.kimi_max_tokens)
+        self.chat_budget(&self.cfg.kimi_url, &self.cfg.kimi_model, messages, Some(key), false, self.cfg.kimi_max_tokens, 1.0)
             .await
     }
 
