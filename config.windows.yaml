@@ -82,6 +82,10 @@ brain:
   kimi_model: "kimi-for-coding"
   kimi_key_file: "kimi-key.txt"   # git-ignored
   max_tokens: 512                  # replies are spoken — keep them small
+  # kimi-for-coding reasons before writing (reasoning tokens count against
+  # the budget), so give the big model room: plans get 64K, escalations 8K.
+  plan_max_tokens: 64000           # lesson plan authoring budget
+  kimi_max_tokens: 8192            # ASK_BIG escalation budget
   timeout_sec: 120
   # Named modes override base settings at runtime via voice command.
   # "Five, switch to dm mode" activates the dm profile below.

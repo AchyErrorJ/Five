@@ -79,6 +79,12 @@ const TOOLS: &str = "You have three tools, invoked as whole lines in your reply:
     - A line starting with \"PLAN: \" asks the big model to write a lesson \
     plan on the given topic; the plan is saved and you then teach it step \
     by step. Use it when the user wants to learn a topic properly.\n\
+    - A line starting with \"NEXT: \" (anything after the colon is fine) \
+    advances to the next section of the lesson you are teaching. Use it once \
+    the student has answered the current section's check question well.\n\
+    - A line starting with \"SECTION: \" jumps to the lesson section whose \
+    heading best matches the given keywords. Use it when the student asks \
+    about something a different section covers.\n\
     These lines are never spoken aloud.\n\
     Example:\n\
     User: I'm Sam and I keep mixing up pointers.\n\
@@ -125,6 +131,10 @@ struct ParsedReply {
     escalation: Option<String>,
     search: Option<String>,
     plan: Option<String>,
+    /// NEXT: — advance to the next lesson section.
+    advance: bool,
+    /// SECTION: <keywords> — jump to the best-matching lesson section.
+    goto_section: Option<String>,
 }
 
 /// Split a reply into spoken text and NOTE:/ASK_BIG:/SEARCH:/PLAN: tool lines.
@@ -134,6 +144,8 @@ fn parse_tools(raw: &str) -> ParsedReply {
     let mut escalation = None;
     let mut search = None;
     let mut plan = None;
+    let mut advance = false;
+    let mut goto_section = None;
     for line in raw.lines() {
         let t = line.trim();
         if let Some(rest) = strip_prefix_ci(t, "note:") {
@@ -152,6 +164,12 @@ fn parse_tools(raw: &str) -> ParsedReply {
             if !rest.is_empty() {
                 plan = Some(rest.to_string());
             }
+        } else if strip_prefix_ci(t, "next:").is_some() {
+            advance = true;
+        } else if let Some(rest) = strip_prefix_ci(t, "section:") {
+            if !rest.is_empty() {
+                goto_section = Some(rest.to_string());
+            }
         } else if !t.is_empty() {
             speech.push(t);
         }
@@ -163,7 +181,7 @@ fn parse_tools(raw: &str) -> ParsedReply {
         .chars()
         .filter(|c| !matches!(c, '*' | '#' | '`' | '_'))
         .collect();
-    ParsedReply { speech, notes, escalation, search, plan }
+    ParsedReply { speech, notes, escalation, search, plan, advance, goto_section }
 }
 
 fn strip_prefix_ci<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
@@ -184,15 +202,77 @@ pub struct Brain {
     searcher: Option<crate::search::Searcher>,
     /// Active mode name (from `cfg.modes`). None = use base config.
     active_mode: std::sync::Mutex<Option<String>>,
-    /// Lesson plan currently being taught: title + markdown body. Set when
-    /// a plan is authored or loaded; folded into the system prompt so the
-    /// local model administers it section by section.
-    active_lesson: std::sync::Mutex<Option<ActiveLesson>>,
+    /// Lesson plan currently being taught. Set when a plan is authored or
+/// loaded; the system prompt carries its summary, outline, and ONLY the
+/// current section's body — a 64K-token plan would never fit the local
+/// model's window, so it consumes the plan one section at a time and
+/// navigates with NEXT:/SECTION: tool lines.
+active_lesson: std::sync::Mutex<Option<ActiveLesson>>,
+}
+
+struct LessonSection {
+    heading: String,
+    body: String,
 }
 
 struct ActiveLesson {
     title: String,
-    body: String,
+    summary: String,
+    sections: Vec<LessonSection>,
+    current: usize,
+}
+
+impl ActiveLesson {
+    fn current_section(&self) -> &LessonSection {
+        &self.sections[self.current.min(self.sections.len() - 1)]
+    }
+}
+
+/// Parse a lesson plan markdown body into summary + sections. Sections split
+/// on `## ` headings; the preamble after the `# Title` line is the summary.
+/// Plans without `## ` headings degrade to a single section.
+fn parse_lesson(title: &str, body: &str) -> ActiveLesson {
+    let mut preamble: Vec<&str> = Vec::new();
+    let mut sections: Vec<LessonSection> = Vec::new();
+    for line in body.lines() {
+        let t = line.trim();
+        if t.starts_with("# ") {
+            continue; // the title line itself
+        }
+        if let Some(h) = t.strip_prefix("## ") {
+            // Drop "1. "/"3) " style numbering from the heading text.
+            let heading = h
+                .trim()
+                .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ')' || c == ' ')
+                .to_string();
+            sections.push(LessonSection { heading, body: String::new() });
+        } else if let Some(sec) = sections.last_mut() {
+            sec.body.push_str(line);
+            sec.body.push('\n');
+        } else {
+            preamble.push(line);
+        }
+    }
+    // Summary = first non-empty paragraph of the preamble.
+    let summary = preamble
+        .join("\n")
+        .split("\n\n")
+        .map(str::trim)
+        .find(|p| !p.is_empty())
+        .unwrap_or("")
+        .to_string();
+    if sections.is_empty() {
+        sections.push(LessonSection {
+            heading: "The lesson".into(),
+            body: body.to_string(),
+        });
+    }
+    ActiveLesson {
+        title: title.to_string(),
+        summary,
+        sections,
+        current: 0,
+    }
 }
 
 impl Brain {
@@ -323,18 +403,27 @@ impl Brain {
             Message {
                 role: "user".into(),
                 content: format!(
-                    "Write a lesson plan for teaching \"{topic}\" to a curious student.\n\
+                    "Write a thorough lesson plan for teaching \"{topic}\" to a curious student.\n\
                      Format:\n\
                      # <short title>\n\
                      One-line summary of what the student will learn.\n\
-                     Then 4 to 6 numbered sections. Each section: a heading, 2-3 sentences of \
-                     explanation in plain spoken English, and one \"Check:\" question to verify \
-                     understanding. The whole plan should be teachable aloud in about ten minutes."
+                     Then 6 to 8 sections, each starting with a \"## \" heading. Each section: \
+                     a clear explanation in plain spoken English (as detailed as the topic \
+                     deserves — depth is welcome, the tutor teaches one section at a time), \
+                     ending with one \"Check:\" question to verify understanding. \
+                     No tables, no images."
                 ),
             },
         ];
         let body = self
-            .chat_budget(&self.cfg.kimi_url, &self.cfg.kimi_model, messages, Some(key), false, 4096)
+            .chat_budget(
+                &self.cfg.kimi_url,
+                &self.cfg.kimi_model,
+                messages,
+                Some(key),
+                false,
+                self.cfg.plan_max_tokens,
+            )
             .await?;
         let title = body
             .lines()
@@ -346,10 +435,7 @@ impl Brain {
         let path = self.cfg.lesson_dir.join(format!("{}.md", slugify(&title)));
         std::fs::write(&path, &body).with_context(|| format!("failed to write {}", path.display()))?;
         info!(path = %path.display(), "lesson plan saved");
-        *self.active_lesson.lock().unwrap() = Some(ActiveLesson {
-            title: title.clone(),
-            body,
-        });
+        *self.active_lesson.lock().unwrap() = Some(parse_lesson(&title, &body));
         Ok(title)
     }
 
@@ -398,10 +484,7 @@ impl Brain {
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .unwrap_or_else(|| stem.replace('-', " "));
-                    *self.active_lesson.lock().unwrap() = Some(ActiveLesson {
-                        title: title.clone(),
-                        body,
-                    });
+                    *self.active_lesson.lock().unwrap() = Some(parse_lesson(&title, &body));
                     self.clear_history(); // start the lesson with a clean slate
                     return Ok(title);
                 }
@@ -418,6 +501,47 @@ impl Brain {
     /// Stop teaching the active lesson. Returns false if none was running.
     pub fn end_lesson(&self) -> bool {
         self.active_lesson.lock().unwrap().take().is_some()
+    }
+
+    /// Advance to the next section of the active lesson. Returns the new
+    /// section's heading, or None when the lesson is finished (the final
+    /// section stays current so follow-up questions still have context).
+    pub fn next_section(&self) -> Option<String> {
+        let mut lesson = self.active_lesson.lock().unwrap();
+        let l = lesson.as_mut()?;
+        if l.current + 1 >= l.sections.len() {
+            return None;
+        }
+        l.current += 1;
+        info!(section = %l.current_section().heading, "lesson advanced");
+        Some(l.current_section().heading.clone())
+    }
+
+    /// Jump to the lesson section best matching `keywords` (grep-style:
+    /// case-insensitive contains over headings first, then bodies). Returns
+    /// the matched heading.
+    pub fn goto_section(&self, keywords: &str) -> Option<String> {
+        let want = keywords.trim().to_lowercase();
+        if want.is_empty() {
+            return None;
+        }
+        let mut lesson = self.active_lesson.lock().unwrap();
+        let l = lesson.as_mut()?;
+        let idx = l
+            .sections
+            .iter()
+            .position(|s| s.heading.to_lowercase().contains(&want))
+            .or_else(|| {
+                // Word-wise match: every query word must appear in heading+body.
+                let words: Vec<&str> = want.split_whitespace().collect();
+                l.sections.iter().position(|s| {
+                    let hay = format!("{}\n{}", s.heading, s.body).to_lowercase();
+                    words.iter().all(|w| hay.contains(w))
+                })
+            })?;
+        l.current = idx;
+        info!(section = %l.current_section().heading, keywords, "lesson jumped");
+        Some(l.current_section().heading.clone())
     }
 
     /// Max history messages derived from the effective context window.
@@ -462,20 +586,40 @@ impl Brain {
             }
             None => persona,
         };
-        // Active lesson plan rides along: the local model administers it
-        // section by section. Capped so a long plan can't crowd out history.
+        // Active lesson plan rides along, but strategically: the local
+        // model's window can't hold a whole plan, so it gets the summary,
+        // the section outline (its map of what's available), and ONLY the
+        // current section's body. It navigates with NEXT:/SECTION: lines.
         let lesson = self.active_lesson.lock().unwrap();
         match lesson.as_ref() {
             Some(l) => {
-                let body: String = l.body.chars().take(6000).collect();
+                let outline = l
+                    .sections
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        format!(
+                            "{}{}. {}",
+                            if i == l.current { "-> " } else { "" },
+                            i + 1,
+                            s.heading
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let cur = l.current_section();
+                let body: String = cur.body.chars().take(2000).collect();
                 format!(
-                    "{base}\n\nYou are currently teaching this lesson plan: \"{}\". \
-                    Walk through it section by section, ONE section at a time. \
-                    Explain the section briefly in your own words, then ask its \
-                    check question. Wait for the student's answer, say whether it \
-                    was right, then move on. Never read the plan verbatim or dump \
-                    multiple sections at once.\n\n{body}",
-                    l.title,
+                    "{base}\n\nYou are teaching the lesson \"{}\". {}\n\n\
+                    Lesson outline (-> marks where you are):\n{}\n\n\
+                    Current section — {}:\n{}\n\n\
+                    Teach ONLY the current section: explain it briefly in your own words, \
+                    then ask its check question. Never read the plan verbatim or dump other \
+                    sections. When the student answers the check question well, say so and \
+                    emit a \"NEXT: go\" line to advance. If the student asks about something \
+                    another outline section covers, emit \"SECTION: <keywords>\" to jump there. \
+                    When the last section is done, congratulate the student and stop teaching.",
+                    l.title, l.summary, outline, cur.heading, body,
                     base = base
                 )
             }
@@ -581,7 +725,7 @@ impl Brain {
             ),
         });
 
-        self.chat(&self.cfg.kimi_url, &self.cfg.kimi_model, messages, Some(key), false)
+        self.chat_budget(&self.cfg.kimi_url, &self.cfg.kimi_model, messages, Some(key), false, self.cfg.kimi_max_tokens)
             .await
     }
 
@@ -603,6 +747,14 @@ impl Brain {
             .await?;
         let parsed = parse_tools(&raw);
         self.append_notes(&parsed.notes);
+        // Lesson navigation: NEXT:/SECTION: just move the cursor — the new
+        // section body is injected into the system prompt on the next turn.
+        if parsed.advance {
+            self.next_section();
+        }
+        if let Some(ref kw) = parsed.goto_section {
+            self.goto_section(kw);
+        }
 
         // Handle SEARCH tool first — may produce speech directly or feed into model
         let search_reply = if let Some(ref query) = parsed.search {
@@ -780,6 +932,8 @@ impl Brain {
         let mut escalation: Option<String> = None;
         let mut search: Option<String> = None;
         let mut plan: Option<String> = None;
+        let mut advance = false;
+        let mut goto_section: Option<String> = None;
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.context("LLM stream read failed")?;
@@ -800,7 +954,7 @@ impl Brain {
                 while let Some(le) = line_buf.find('\n') {
                     let line = line_buf[..le].trim().to_string();
                     line_buf.drain(..=le);
-                    self.handle_stream_line(&line, &mut speech_buf, &mut escalation, &mut search, &mut plan, record);
+                    self.handle_stream_line(&line, &mut speech_buf, &mut escalation, &mut search, &mut plan, &mut advance, &mut goto_section, record);
                 }
                 // Complete spoken sentences can go straight to TTS.
                 self.drain_sentences(&mut speech_buf, &out, &mut spoken, false).await;
@@ -809,9 +963,21 @@ impl Brain {
         // Flush: last line without a trailing newline, then the last clause.
         let tail = line_buf.trim().to_string();
         if !tail.is_empty() {
-            self.handle_stream_line(&tail, &mut speech_buf, &mut escalation, &mut search, &mut plan, record);
+            self.handle_stream_line(&tail, &mut speech_buf, &mut escalation, &mut search, &mut plan, &mut advance, &mut goto_section, record);
         }
         self.drain_sentences(&mut speech_buf, &out, &mut spoken, true).await;
+
+        // Lesson navigation requested during the stream: move the cursor; the
+        // new section body enters the system prompt on the next turn. Never
+        // in speculative runs — a wrong guess must not move the lesson.
+        if record {
+            if advance {
+                self.next_section();
+            }
+            if let Some(ref kw) = goto_section {
+                self.goto_section(kw);
+            }
+        }
 
         // Search after the local stream: if the model asked for a web search,
         // perform it and speak the results.
@@ -874,7 +1040,7 @@ impl Brain {
     /// Route one completed line of model output: tool lines to their
     /// handlers, spoken lines into the speech buffer. With `record: false`
     /// (speculation), NOTE lines are dropped instead of written.
-    fn handle_stream_line(&self, line: &str, speech_buf: &mut String, escalation: &mut Option<String>, search: &mut Option<String>, plan: &mut Option<String>, record: bool) {
+    fn handle_stream_line(&self, line: &str, speech_buf: &mut String, escalation: &mut Option<String>, search: &mut Option<String>, plan: &mut Option<String>, advance: &mut bool, goto_section: &mut Option<String>, record: bool) {
         if line.is_empty() {
             return;
         }
@@ -893,6 +1059,12 @@ impl Brain {
         } else if let Some(rest) = strip_prefix_ci(line, "plan:") {
             if record && !rest.is_empty() {
                 *plan = Some(rest.to_string());
+            }
+        } else if strip_prefix_ci(line, "next:").is_some() {
+            *advance = true;
+        } else if let Some(rest) = strip_prefix_ci(line, "section:") {
+            if !rest.is_empty() {
+                *goto_section = Some(rest.to_string());
             }
         } else {
             if !speech_buf.is_empty() {
@@ -998,6 +1170,42 @@ mod tests {
         let p = parse_tools("Great idea!\nPLAN: the french revolution");
         assert_eq!(p.speech, "Great idea!");
         assert_eq!(p.plan.as_deref(), Some("the french revolution"));
+
+        // lesson navigation tools
+        let p = parse_tools("Correct!\nNEXT: go");
+        assert_eq!(p.speech, "Correct!");
+        assert!(p.advance);
+        let p = parse_tools("That is covered later.\nSECTION: napoleon");
+        assert_eq!(p.goto_section.as_deref(), Some("napoleon"));
+    }
+
+    #[test]
+    fn lesson_parsing() {
+        let body = "# Operating Systems\n\
+                    Learn how an OS manages hardware.\n\
+                    \n\
+                    ## 1. Kernels\n\
+                    The kernel is the core.\n\
+                    Check: what does the kernel do?\n\
+                    \n\
+                    ## 2. Scheduling\n\
+                    The scheduler picks who runs.\n\
+                    Check: what is a timeslice?\n";
+        let l = parse_lesson("Operating Systems", body);
+        assert_eq!(l.title, "Operating Systems");
+        assert_eq!(l.summary, "Learn how an OS manages hardware.");
+        assert_eq!(l.sections.len(), 2);
+        assert_eq!(l.sections[0].heading, "Kernels");
+        assert!(l.sections[0].body.contains("The kernel is the core."));
+        assert_eq!(l.sections[1].heading, "Scheduling");
+        assert_eq!(l.current, 0);
+        assert_eq!(l.current_section().heading, "Kernels");
+
+        // No ## headings: one catch-all section; the preamble is the summary.
+        let l = parse_lesson("Plain", "Just some text.\nMore text.");
+        assert_eq!(l.sections.len(), 1);
+        assert_eq!(l.sections[0].heading, "The lesson");
+        assert_eq!(l.summary, "Just some text.\nMore text.");
     }
 
     #[test]

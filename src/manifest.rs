@@ -58,6 +58,8 @@ pub fn static_capabilities() -> Vec<Capability> {
             examples: &[
                 "make a lesson plan for the french revolution",
                 "start the lesson",
+                "next section",
+                "skip to the section on napoleon",
                 "list lessons",
                 "end the lesson",
             ],

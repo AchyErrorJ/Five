@@ -262,7 +262,7 @@ fn manifest_help_text(devices: &[String], scenes: &[String], has_files: bool, ha
     if has_brain {
         parts.push("Memory: I keep a notebook between sessions, and remember useful facts.".to_string());
         parts.push("Search: ask me to look something up on the web.".to_string());
-        parts.push("Lessons: say make a lesson plan for, then a topic — then start the lesson, and I'll teach it step by step. Say list lessons or end the lesson anytime.".to_string());
+        parts.push("Lessons: say make a lesson plan for, then a topic — then start the lesson, and I'll teach it step by step. Say next section, skip to, list lessons, or end the lesson anytime.".to_string());
     }
 
     if has_files {
@@ -416,6 +416,10 @@ enum LessonCmd {
     List,
     Start(String),
     End,
+    /// Advance to the next section.
+    Next,
+    /// Jump to the section matching these keywords.
+    Jump(String),
 }
 
 /// Drop whisper's leading noise tags — "[clears throat] start the lesson"
@@ -437,6 +441,25 @@ fn wants_lesson_command(text: &str) -> Option<LessonCmd> {
     let lowered = text.trim().to_lowercase();
     let t = strip_leading_noise(&lowered);
     let t = t.trim_end_matches(['.', '!', '?']);
+
+    // Next section
+    if matches!(
+        t,
+        "next section" | "next part" | "next lesson section" | "move on" | "move to the next section"
+            | "go on" | "continue the lesson" | "continue lesson" | "skip ahead"
+    ) {
+        return Some(LessonCmd::Next);
+    }
+
+    // Jump: "skip to X", "jump to the section on X", "go to the part about X"
+    for prefix in ["skip to the section on ", "skip to the section ", "skip to ", "jump to the section on ", "jump to the section ", "jump to ", "go to the part about ", "go to the section on ", "go to the section "] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                return Some(LessonCmd::Jump(rest.to_string()));
+            }
+        }
+    }
 
     // End
     if matches!(
@@ -934,6 +957,29 @@ fn dispatch_command(
                         "There's no lesson running.".to_string()
                     }
                 }
+                LessonCmd::Next => match brain.next_section() {
+                    // Cursor moved — hand the model the new section so it
+                    // starts teaching it right away.
+                    Some(_) => rt
+                        .block_on(brain.respond("(The student is ready — teach the next section now.)"))
+                        .unwrap_or_else(|e| {
+                            tracing::error!("brain failed after section advance: {e:#}");
+                            "Moving on.".to_string()
+                        }),
+                    None => "That was the last section — lesson complete. Well done!".to_string(),
+                },
+                LessonCmd::Jump(kw) => match brain.goto_section(&kw) {
+                    Some(heading) => rt
+                        .block_on(brain.respond(&format!("(The student asked about {heading} — teach that section now.)")))
+                        .unwrap_or_else(|e| {
+                            tracing::error!("brain failed after section jump: {e:#}");
+                            format!("Jumping to {heading}.")
+                        }),
+                    None => match brain.current_lesson() {
+                        Some(_) => "I can't find a section about that in this lesson.".to_string(),
+                        None => "There's no lesson running.".to_string(),
+                    },
+                },
             };
             if let Some(d) = dash {
                 d.push(dashboard::DashEvent::Response { text: reply.clone(), done: true });

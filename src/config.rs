@@ -242,6 +242,15 @@ pub struct BrainConfig {
     /// model, administered step-by-step by the local model).
     #[serde(default = "default_lesson_dir")]
     pub lesson_dir: PathBuf,
+    /// Completion budget for authoring a lesson plan with the big model.
+    /// kimi-for-coding reasons before writing (reasoning counts against the
+    /// budget) and a good plan is long — keep this big.
+    #[serde(default = "default_plan_max_tokens")]
+    pub plan_max_tokens: u32,
+    /// Completion budget for ASK_BIG escalations to the big model. Reasoning
+    /// tokens count against it, so 512 would starve kimi-for-coding.
+    #[serde(default = "default_kimi_max_tokens")]
+    pub kimi_max_tokens: u32,
     /// Named brain modes that override base settings at runtime.
     /// Switch via voice: "Five, switch to dm mode".
     #[serde(default)]
@@ -267,6 +276,8 @@ impl Default for BrainConfig {
             max_tokens: default_max_tokens(),
             context_window: default_context_window(),
             lesson_dir: default_lesson_dir(),
+            plan_max_tokens: default_plan_max_tokens(),
+            kimi_max_tokens: default_kimi_max_tokens(),
             modes: std::collections::HashMap::new(),
             timeout_sec: default_brain_timeout(),
         }
@@ -299,6 +310,12 @@ fn default_context_window() -> u32 {
 }
 fn default_lesson_dir() -> PathBuf {
     PathBuf::from("lessonplans")
+}
+fn default_plan_max_tokens() -> u32 {
+    64000
+}
+fn default_kimi_max_tokens() -> u32 {
+    8192
 }
 fn default_brain_timeout() -> u64 {
     120
