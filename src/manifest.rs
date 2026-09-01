@@ -76,8 +76,8 @@ pub fn static_capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "bridge",
-            description: "Send command to Claude Code",
-            examples: &["bridge this to Claude Code"],
+            description: "Route voice to a live Claude Code session",
+            examples: &["switch to coding mode", "back to normal"],
         },
         Capability {
             name: "help",

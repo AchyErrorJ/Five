@@ -22,6 +22,9 @@ pub struct AppConfig {
     /// LLM routing: local 4B for easy asks, Kimi coding API for the rest
     #[serde(default)]
     pub brain: BrainConfig,
+    /// Coding mode: route voice to a live Claude Code session via a bridge file
+    #[serde(default)]
+    pub coding: CodingConfig,
     /// Smart home control via Home Assistant
     #[serde(default)]
     pub home: HomeConfig,
@@ -327,6 +330,34 @@ fn default_kimi_timeout() -> u64 {
 }
 fn default_brain_timeout() -> u64 {
     120
+}
+
+/// Coding mode: while active, voice utterances are appended to a bridge file
+/// that a live Claude Code session tails; it replies via `five-daemon speak`.
+/// Same mechanism as `listen --bridge`, but toggled at runtime by voice.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CodingConfig {
+    #[serde(default = "default_coding_enabled")]
+    pub enabled: bool,
+    /// File utterances are appended to while coding mode is active.
+    #[serde(default = "default_coding_bridge_file")]
+    pub bridge_file: PathBuf,
+}
+
+impl Default for CodingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_coding_enabled(),
+            bridge_file: default_coding_bridge_file(),
+        }
+    }
+}
+
+fn default_coding_enabled() -> bool {
+    true
+}
+fn default_coding_bridge_file() -> PathBuf {
+    PathBuf::from("claude-bridge.txt")
 }
 
 /// A named mode that overrides selected brain settings at runtime.

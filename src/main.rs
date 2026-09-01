@@ -255,6 +255,7 @@ fn manifest_help_text(devices: &[String], scenes: &[String], has_files: bool, ha
         "General chat: ask me anything.".to_string(),
         "Conversation: after saying five once, just keep talking — I'm still listening.".to_string(),
         "Modes: say switch to D M mode, or back to normal.".to_string(),
+        "Coding: say switch to coding mode to talk to Claude Code; say back to normal to exit.".to_string(),
         "Context: say clear context to start fresh.".to_string(),
         "Time: ask what time is it.".to_string(),
     ];
@@ -403,6 +404,10 @@ fn wants_mode_switch(text: &str) -> Option<String> {
     // Shorthand: "dm mode", "deep think mode"
     if t == "dm mode" || t == "deep think mode" || t == "deep thinking mode" {
         return Some("dm".to_string());
+    }
+    // "coding mode" — handled as a routing mode, not a brain mode
+    if t == "coding mode" || t == "code mode" {
+        return Some("coding".to_string());
     }
     if t == "normal mode" || t == "default mode" || t == "back to normal" {
         return Some("".to_string());
@@ -752,6 +757,8 @@ fn ask_and_speak(
 fn dispatch_command(
     text: &str,
     bridge: &Option<PathBuf>,
+    coding: &Option<PathBuf>,
+    coding_active: &std::cell::Cell<bool>,
     brain: &Option<std::sync::Arc<brain::Brain>>,
     home_client: &Option<std::sync::Arc<home::HomeClient>>,
     file_mgr: &Option<std::sync::Arc<files::FileManager>>,
@@ -872,6 +879,62 @@ fn dispatch_command(
             });
         }
         return Ok(());
+    }
+
+    // Coding mode: a runtime-toggled bridge to a live Claude Code session.
+    // While active, utterances are appended to the bridge file and the
+    // session replies aloud via `five-daemon speak`. ("switch to coding
+    // mode" enters; "back to normal" exits.)
+    if let Some(path) = coding {
+        let t = text.trim().to_lowercase();
+        let t = t.trim_end_matches(['.', '!', '?']);
+        let switch = wants_mode_switch(t);
+        if !coding_active.get() && switch.as_deref() == Some("coding") {
+            coding_active.set(true);
+            let reply = "Coding mode on — everything you say goes to Claude Code. Say back to normal to exit.";
+            println!("<< {reply}");
+            if let Some(d) = dash {
+                d.push(dashboard::DashEvent::System {
+                    message: "Coding mode on".to_string(),
+                });
+            }
+            if let Err(e) = say_streamed(speaker, reply, rt, device) {
+                tracing::error!("speech failed: {e:#}");
+            }
+            return Ok(());
+        }
+        if coding_active.get() {
+            if switch.as_deref() == Some("")
+                || matches!(t, "exit coding mode" | "stop coding" | "leave coding mode")
+            {
+                coding_active.set(false);
+                let reply = "Back to normal.";
+                println!("<< {reply}");
+                if let Some(d) = dash {
+                    d.push(dashboard::DashEvent::System {
+                        message: "Coding mode off".to_string(),
+                    });
+                }
+                if let Err(e) = say_streamed(speaker, reply, rt, device) {
+                    tracing::error!("speech failed: {e:#}");
+                }
+                return Ok(());
+            }
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("failed to open coding bridge {}", path.display()))?;
+            writeln!(f, "{text}")?;
+            println!("<< [to Claude Code]");
+            if let Some(d) = dash {
+                d.push(dashboard::DashEvent::System {
+                    message: "Sent to Claude Code".to_string(),
+                });
+            }
+            return Ok(());
+        }
     }
     if let Some(brain) = brain {
         // Home Assistant commands: deterministic, fast, no LLM needed.
@@ -1114,6 +1177,14 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
     } else {
         None
     };
+    // Coding mode: same bridge-file mechanism, toggled at runtime by voice
+    // ("switch to coding mode" / "back to normal").
+    let coding: Option<PathBuf> = if bridge.is_none() && config.coding.enabled {
+        Some(config.coding.bridge_file.clone())
+    } else {
+        None
+    };
+    let coding_active = std::cell::Cell::new(false);
     let home_client = if !config.home.url.is_empty() && !config.home.token.is_empty() {
         Some(std::sync::Arc::new(home::HomeClient::new(&config.home)?))
     } else {
@@ -1247,6 +1318,8 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                     } else if let Err(e) = dispatch_command(
                         &text,
                         &bridge,
+                        &coding,
+                        &coding_active,
                         &brain,
                         &home_client,
                         &file_mgr,
@@ -1335,6 +1408,8 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                         if let Err(e) = dispatch_command(
                             &cmd,
                             &bridge,
+                            &coding,
+                            &coding_active,
                             &brain,
                             &home_client,
                             &file_mgr,
@@ -1376,6 +1451,8 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                             if let Err(e) = dispatch_command(
                                 cmd,
                                 &bridge,
+                                &coding,
+                                &coding_active,
                                 &brain,
                                 &home_client,
                                 &file_mgr,
@@ -1518,4 +1595,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wants_mode_switch;
+
+    #[test]
+    fn mode_switch_parsing() {
+        assert_eq!(wants_mode_switch("switch to coding mode").as_deref(), Some("coding"));
+        assert_eq!(wants_mode_switch("coding mode").as_deref(), Some("coding"));
+        assert_eq!(wants_mode_switch("code mode").as_deref(), Some("coding"));
+        assert_eq!(wants_mode_switch("switch to dm mode").as_deref(), Some("dm"));
+        assert_eq!(wants_mode_switch("back to normal").as_deref(), Some(""));
+        assert_eq!(wants_mode_switch("what time is it"), None);
+    }
 }

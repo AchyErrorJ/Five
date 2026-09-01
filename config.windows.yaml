@@ -88,6 +88,12 @@ brain:
   kimi_max_tokens: 8192            # ASK_BIG escalation budget
   kimi_timeout_sec: 1800           # 64K plans stream for many minutes
   timeout_sec: 120
+
+# Coding mode: "Five, switch to coding mode" routes utterances to a live
+# Claude Code session tailing this file; it replies via `five-daemon speak`.
+coding:
+  enabled: true
+  bridge_file: "claude-bridge.txt"
   # Named modes override base settings at runtime via voice command.
   # "Five, switch to dm mode" activates the dm profile below.
   modes:
