@@ -517,7 +517,7 @@ fn wants_lesson_command(text: &str) -> Option<LessonCmd> {
     }
 
     // Start: "start lesson", "start the lesson on X", "teach me X", "load lesson X"
-    for prefix in ["start the lesson", "start lesson", "start my lesson", "begin the lesson", "begin lesson", "load lesson", "open lesson", "resume lesson", "resume the lesson"] {
+    for prefix in ["start the lesson", "start a lesson", "start lesson", "start my lesson", "begin the lesson", "begin a lesson", "begin lesson", "load lesson", "open lesson", "resume lesson", "resume the lesson", "do the lesson", "do a lesson", "do lesson"] {
         if let Some(rest) = t.strip_prefix(prefix) {
             let rest = rest
                 .trim()
@@ -533,6 +533,22 @@ fn wants_lesson_command(text: &str) -> Option<LessonCmd> {
     }
     if t == "teach me" || t == "start teaching" || t == "start the lesson" {
         return Some(LessonCmd::Start(String::new()));
+    }
+
+    // "do the reading buildings lesson plan" / "teach the X lesson" —
+    // leading verb + trailing "lesson (plan)" with the lesson name inside.
+    if t.ends_with("lesson plan") || t.ends_with("lesson") {
+        if let Some(mid) = t
+            .strip_prefix("do the ")
+            .or_else(|| t.strip_prefix("do "))
+            .or_else(|| t.strip_prefix("teach the "))
+        {
+            let mid = mid
+                .trim_end_matches("lesson plan")
+                .trim_end_matches("lesson")
+                .trim();
+            return Some(LessonCmd::Start(mid.to_string()));
+        }
     }
 
     None
