@@ -86,7 +86,7 @@ brain:
   # the budget), so give the big model room: plans get 64K, escalations 8K.
   plan_max_tokens: 64000           # lesson plan authoring budget
   kimi_max_tokens: 8192            # ASK_BIG escalation budget
-  kimi_timeout_sec: 600            # big plans take minutes — default 120s is fatal
+  kimi_timeout_sec: 1800           # 64K plans stream for many minutes
   timeout_sec: 120
   # Named modes override base settings at runtime via voice command.
   # "Five, switch to dm mode" activates the dm profile below.

@@ -323,7 +323,7 @@ fn default_kimi_max_tokens() -> u32 {
     8192
 }
 fn default_kimi_timeout() -> u64 {
-    600
+    1800
 }
 fn default_brain_timeout() -> u64 {
     120

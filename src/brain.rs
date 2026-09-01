@@ -416,15 +416,14 @@ impl Brain {
             },
         ];
         let body = self
-            .chat_budget(
+            .chat_stream_collect(
                 &self.cfg.kimi_url,
                 &self.cfg.kimi_model,
                 messages,
                 Some(key),
-                false,
                 self.cfg.plan_max_tokens,
                 1.0, // kimi-for-coding: "only 1 is allowed for this model"
-                Some(self.cfg.kimi_timeout_sec),
+                self.cfg.kimi_timeout_sec,
             )
             .await?;
         let title = body
@@ -711,6 +710,83 @@ impl Brain {
             .map(|c| c.message.content.trim().to_string())
             .filter(|s| !s.is_empty())
             .context("LLM returned no content")
+    }
+
+    /// Streaming variant for very long generations (lesson plans). A 64K-token
+    /// completion takes many minutes; reading SSE deltas as they land keeps
+    /// the connection alive and lets us salvage whatever arrived if the
+    /// stream dies partway. Reasoning deltas are skipped — only content.
+    async fn chat_stream_collect(
+        &self,
+        url: &str,
+        model: &str,
+        messages: Vec<Message>,
+        bearer: Option<&str>,
+        max_tokens: u32,
+        temperature: f32,
+        timeout_sec: u64,
+    ) -> anyhow::Result<String> {
+        let req = ChatRequest {
+            model: model.to_string(),
+            messages,
+            max_tokens,
+            temperature,
+            stream: true,
+            reasoning_effort: None,
+        };
+        let mut rb = self
+            .http
+            .post(format!("{url}/chat/completions"))
+            .json(&req)
+            .timeout(std::time::Duration::from_secs(timeout_sec));
+        if let Some(key) = bearer {
+            rb = rb.bearer_auth(key);
+        }
+        let resp = rb.send().await.context("LLM request failed")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("LLM returned {status}: {}", &body[..body.len().min(300)]);
+        }
+        use futures_util::StreamExt;
+        let mut stream = resp.bytes_stream();
+        let mut sse_buf = String::new();
+        let mut content = String::new();
+        let mut last_log = std::time::Instant::now();
+        while let Some(chunk) = stream.next().await {
+            let bytes = match chunk {
+                Ok(b) => b,
+                Err(e) => {
+                    if content.is_empty() {
+                        return Err(e).context("LLM stream read failed");
+                    }
+                    warn!("plan stream died with {} chars collected — keeping the partial plan", content.len());
+                    break;
+                }
+            };
+            sse_buf.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(nl) = sse_buf.find('\n') {
+                let event = sse_buf[..nl].trim_end_matches('\r').to_string();
+                sse_buf.drain(..=nl);
+                let Some(payload) = event.strip_prefix("data: ") else { continue };
+                if payload.trim() == "[DONE]" {
+                    break;
+                }
+                let Ok(chunk) = serde_json::from_str::<StreamChunk>(payload) else { continue };
+                if let Some(piece) = chunk.choices.into_iter().next().and_then(|c| c.delta.content) {
+                    content.push_str(&piece);
+                }
+            }
+            if last_log.elapsed().as_secs() >= 30 {
+                info!(chars = content.len(), "plan still streaming");
+                last_log = std::time::Instant::now();
+            }
+        }
+        let content = content.trim().to_string();
+        if content.is_empty() {
+            anyhow::bail!("LLM returned no content");
+        }
+        Ok(content)
     }
 
     /// Ask Kimi (tier 2) with full conversation context so it assumes the
