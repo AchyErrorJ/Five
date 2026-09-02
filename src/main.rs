@@ -920,6 +920,11 @@ fn dispatch_command(
                 }
                 return Ok(());
             }
+            // Don't bridge dead air / whisper noise — the session on the
+            // other end treats every line as a command.
+            if is_non_speech(text) {
+                return Ok(());
+            }
             use std::io::Write;
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
