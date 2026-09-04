@@ -29,6 +29,19 @@ echo    ╚═══════════════════════
 echo.
 
 :: ---------------------------------------------------------------------------
+:: CHECK: Is Five already running?
+:: ---------------------------------------------------------------------------
+tasklist /FI "IMAGENAME eq five-daemon.exe" 2>nul | find /I "five-daemon.exe" >nul
+if %ERRORLEVEL% == 0 (
+    echo [WARN] five-daemon.exe is ALREADY RUNNING.
+    echo        Check Task Manager or run: taskkill /IM five-daemon.exe /F
+    echo.
+    echo        Press any key to exit.
+    pause >nul
+    exit /b 1
+)
+
+:: ---------------------------------------------------------------------------
 :: 1. Find the five-daemon binary
 :: ---------------------------------------------------------------------------
 set "FIVE_BIN="
