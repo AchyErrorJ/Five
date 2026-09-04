@@ -164,10 +164,21 @@ echo    ║  Say "Five" or just speak — it listens to everything.             
 echo    ║  Press Ctrl+C to stop.                                               ║
 echo    ╚══════════════════════════════════════════════════════════════════════╝
 echo.
-echo [TIP] If no commands come through, press Ctrl+C and run this script
-echo       again, then pick D for Diagnose mode.
+echo [TIP] If this window closes instantly, run this script from cmd.exe to
+echo       see the error:   .\start-five.bat
 echo.
 "%FIVE_BIN%" --config "%CONFIG%" listen
+if %ERRORLEVEL% NEQ 0 (
+    echo.
+    echo [CRASH] five-daemon exited with code %ERRORLEVEL%
+    echo         Common causes on Windows:
+    echo         - Missing Visual C++ Redistributable
+    echo         - output_device "Esinkin" not connected ^(edit config.windows.yaml^)
+    echo         - Mic permission denied in Windows Privacy settings
+    echo.
+    echo         Run from cmd.exe to see full error output.
+    pause
+)
 goto :END
 
 :: ---------------------------------------------------------------------------
