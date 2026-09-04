@@ -138,11 +138,13 @@ echo      2 — Coding mode  (routes to Claude Code bridge)
 echo      3 — Test audio   (record 3s, then speak it back)
 echo      4 — Test STT     (record 5s, transcribe to text)
 echo      5 — Just run     (skip menu, start immediately)
+echo      D — Diagnose     (full audio pipeline check)
 echo      Q — Quit
 echo.
 set /p MODE="Pick: "
 
 if /i "%MODE%"=="q" exit /b 0
+if /i "%MODE%"=="d" goto :DIAGNOSE
 if "%MODE%"=="5" goto :RUN
 if "%MODE%"=="1" goto :RUN
 if "%MODE%"=="2" goto :CODING
@@ -161,6 +163,9 @@ echo    ║  Starting Five...                                                   
 echo    ║  Say "Five" or just speak — it listens to everything.                ║
 echo    ║  Press Ctrl+C to stop.                                               ║
 echo    ╚══════════════════════════════════════════════════════════════════════╝
+echo.
+echo [TIP] If no commands come through, press Ctrl+C and run this script
+echo       again, then pick D for Diagnose mode.
 echo.
 "%FIVE_BIN%" --config "%CONFIG%" listen
 goto :END
@@ -203,6 +208,50 @@ echo [..] Transcribing...
 "%FIVE_BIN%" --config "%CONFIG%" transcribe test-stt.wav
 del test-stt.wav 2>nul
 pause
+goto :END
+
+:: ---------------------------------------------------------------------------
+:: DIAGNOSE — Full pipeline check
+:: ---------------------------------------------------------------------------
+:DIAGNOSE
+echo.
+echo    ╔══════════════════════════════════════════════════════════════════════╗
+echo    ║  DIAGNOSTIC MODE — Full audio pipeline check                         ║
+echo    ╚══════════════════════════════════════════════════════════════════════╝
+echo.
+
+:: Test 1: Record
+echo [TEST 1/3] Recording 5 seconds — SAY SOMETHING CLEARLY into your mic...
+"%FIVE_BIN%" --config "%CONFIG%" record --output diagnose.wav --duration 5
+if not exist "diagnose.wav" (
+    echo [FAIL] Recording failed. Check your mic is enabled and set as default.
+    goto :DIAG_END
+)
+echo [OK] Recording saved.
+echo.
+
+:: Test 2: Transcribe
+echo [TEST 2/3] Transcribing what you said...
+"%FIVE_BIN%" --config "%CONFIG%" transcribe diagnose.wav
+echo.
+
+:: Test 3: TTS
+echo [TEST 3/3] Testing text-to-speech...
+"%FIVE_BIN%" --config "%CONFIG%" speak "If you can hear this, Five's audio output is working."
+echo.
+
+echo [..] Did you hear the voice? Did the transcription show your words?
+echo.
+echo      If recording failed     =^> mic issue. Check Windows Sound Settings.
+echo      If transcribe is blank  =^> audio too quiet, or model issue.
+echo      If no voice heard       =^> output_device in config.windows.yaml
+echo                               may point to a disconnected device.
+echo      If all 3 passed         =^> audio works. Issue may be OpenClaw gateway.
+echo.
+
+:DIAG_END
+pause
+del diagnose.wav 2>nul
 goto :END
 
 :: ---------------------------------------------------------------------------
