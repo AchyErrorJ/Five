@@ -187,6 +187,30 @@ fn extract_command(text: &str) -> Option<String> {
     None
 }
 
+/// Music-mode wake word: the word must be the FIRST word of the transcript
+/// and followed by at least two more words. Lyrics mention "five" mid-line
+/// ("it's five o'clock", "five hundred miles") but almost never open a line
+/// with it plus a full command; real usage ("Five, stop the music") does.
+fn extract_command_strict(text: &str) -> Option<String> {
+    let t = text.trim_start();
+    let first_end = t.find(|c: char| !c.is_alphanumeric())?;
+    let first = &t[..first_end];
+    if !(first.eq_ignore_ascii_case("five") || first == "5") {
+        return None;
+    }
+    let rest = t[first_end..]
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .trim();
+    let words = rest
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .count();
+    if words < 2 {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
 /// Deterministic local answers for questions an LLM can only hallucinate —
 /// time and date come from the system clock, phrased for speech. Anything
 /// not matched here falls through to the brain/agents.
@@ -1296,6 +1320,15 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
         );
     }
 
+    // Music detector state: EMA of "chunk above absolute music level"
+    // (~10s time constant at 100ms chunks) plus timestamps of recently
+    // endpointed utterances. Music playing in the room keeps the mic hot
+    // for minutes AND makes lyrics endpoint constantly; either signal
+    // arms a stricter wake-word match so "five" in lyrics doesn't fire.
+    let mut music_ema = 0.0f32;
+    let mut recent_utts: std::collections::VecDeque<std::time::Instant> = Default::default();
+    let mut music_armed = false;
+
     while let Some(chunk) = capture.recv() {
         // --- Collecting a command: accumulate until command_len, then handle.
         if let Some(buf) = &mut command {
@@ -1360,6 +1393,10 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
         // fire when the text contains the word "five".
         if text_trigger {
             let rms = (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len().max(1) as f32).sqrt();
+            // Music detector: absolute energy EMA. A quiet room sits at
+            // floor≈0.0002; music through the speakers keeps rms ≥0.001
+            // nearly every chunk.
+            music_ema = music_ema * 0.99 + if rms > 0.001 { 0.01 } else { 0.0 };
             // Tuning telemetry: every ~5s, log background floor vs current
             // level so endpointing thresholds can be set from real data.
             static_diag_counter += 1;
@@ -1403,11 +1440,31 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                 audio_ms = audio.len() * 1000 / rate,
                 "utterance transcribed"
             );
+            // Music detector: lyrics endpoint constantly while a song plays
+            // (several transcribed lines a minute vs ~zero in a quiet room).
+            let now = std::time::Instant::now();
+            recent_utts.push_back(now);
+            while recent_utts
+                .front()
+                .is_some_and(|t| now.duration_since(*t) > std::time::Duration::from_secs(60))
+            {
+                recent_utts.pop_front();
+            }
+            let music = music_ema > 0.6 || recent_utts.len() >= 4;
+            if music != music_armed {
+                music_armed = music;
+                tracing::info!(
+                    music = music,
+                    ema = format!("{:.2}", music_ema),
+                    utts_60s = recent_utts.len(),
+                    "music mode changed — wake word is strict"
+                );
+            }
             if is_non_speech(&text) {
                 continue;
             }
             let hot = hot_until.is_some_and(|t| t > std::time::Instant::now());
-            match extract_command(&text) {
+            match if music { extract_command_strict(&text) } else { extract_command(&text) } {
                 Some(cmd) if !cmd.is_empty() => {
                     if !spec.as_ref().is_some_and(|s| s.try_play(&cmd)) {
                         if let Err(e) = dispatch_command(
@@ -1604,7 +1661,21 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::wants_mode_switch;
+    use super::{extract_command, extract_command_strict, wants_mode_switch};
+
+    #[test]
+    fn music_mode_strict_trigger() {
+        // Lyrics mentioning five mid-line: normal mode fires, music mode must not.
+        assert!(extract_command("it's five o'clock somewhere").is_some());
+        assert_eq!(extract_command_strict("it's five o'clock somewhere"), None);
+        assert_eq!(extract_command_strict("and five hundred miles more"), None);
+        // Wake word alone isn't a command.
+        assert_eq!(extract_command_strict("five"), None);
+        // Real commands still get through.
+        assert_eq!(extract_command_strict("Five, stop the music").as_deref(), Some("stop the music"));
+        assert_eq!(extract_command_strict("five switch to coding mode").as_deref(), Some("switch to coding mode"));
+        assert_eq!(extract_command_strict("5. what time is it").as_deref(), Some("what time is it"));
+    }
 
     #[test]
     fn mode_switch_parsing() {
