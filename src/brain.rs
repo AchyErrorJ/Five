@@ -185,8 +185,11 @@ fn parse_tools(raw: &str) -> ParsedReply {
 }
 
 fn strip_prefix_ci<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
-    if line.len() >= prefix.len() && line[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(line[prefix.len()..].trim())
+    // Case-insensitive ASCII prefix match; slice on char boundaries only —
+    // a curly apostrophe or emoji early in the line must not panic.
+    let head: String = line.chars().take(prefix.chars().count()).collect();
+    if head.len() == prefix.len() && head.eq_ignore_ascii_case(prefix) {
+        Some(line[head.len()..].trim())
     } else {
         None
     }
@@ -1262,6 +1265,11 @@ mod tests {
         assert!(p.advance);
         let p = parse_tools("That is covered later.\nSECTION: napoleon");
         assert_eq!(p.goto_section.as_deref(), Some("napoleon"));
+
+        // multi-byte chars early in the line must not panic the prefix matcher
+        let p = parse_tools("That’s a great start — no tool here.");
+        assert_eq!(p.speech, "That’s a great start — no tool here.");
+        assert!(p.notes.is_empty());
     }
 
     #[test]
