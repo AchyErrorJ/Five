@@ -28,6 +28,9 @@ pub struct AppConfig {
     /// Smart home control via Home Assistant
     #[serde(default)]
     pub home: HomeConfig,
+    /// Direct light control (Nanoleaf local Open API; Hue bridge later)
+    #[serde(default)]
+    pub lights: LightsConfig,
     /// Web search tool: allowed sites, max results, timeout
     #[serde(default)]
     pub search: SearchConfig,
@@ -395,6 +398,44 @@ pub struct HomeConfig {
 
 fn default_home_timeout() -> u64 {
     10
+}
+
+/// Direct light control (no Home Assistant): Nanoleaf devices on the local
+/// Open API (port 16021). Pair once with `five-daemon pair-nanoleaf <name>`
+/// while the controller is in pairing mode.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LightsConfig {
+    #[serde(default = "default_lights_enabled")]
+    pub enabled: bool,
+    /// Friendly name -> Nanoleaf device, e.g. "nanoleaf" or "desk panels".
+    #[serde(default)]
+    pub nanoleaf: std::collections::HashMap<String, NanoleafConfig>,
+    /// Request timeout in seconds.
+    #[serde(default = "default_home_timeout")]
+    pub timeout_sec: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NanoleafConfig {
+    /// Host or IP of the controller (e.g. "192.168.1.50").
+    pub host: String,
+    /// File containing ONLY the auth token (git-ignored, like kimi-key.txt).
+    /// Written by `five-daemon pair-nanoleaf`.
+    pub token_file: PathBuf,
+}
+
+impl Default for LightsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_lights_enabled(),
+            nanoleaf: std::collections::HashMap::new(),
+            timeout_sec: default_home_timeout(),
+        }
+    }
+}
+
+fn default_lights_enabled() -> bool {
+    true
 }
 
 impl Default for HomeConfig {

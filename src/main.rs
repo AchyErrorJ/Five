@@ -5,6 +5,7 @@ mod config;
 mod dashboard;
 mod files;
 mod almanach;
+mod lights;
 mod openclaw;
 mod search;
 mod transcribe;
@@ -79,6 +80,11 @@ enum Command {
     Speak {
         /// Text to speak
         text: String,
+    },
+    /// Pair with a Nanoleaf controller in pairing mode and save the token
+    PairNanoleaf {
+        /// Device name from the config's lights.nanoleaf map
+        name: String,
     },
     /// List audio output devices (for the audio.output_device config key)
     Devices,
@@ -785,6 +791,7 @@ fn dispatch_command(
     coding_active: &std::cell::Cell<bool>,
     brain: &Option<std::sync::Arc<brain::Brain>>,
     home_client: &Option<std::sync::Arc<home::HomeClient>>,
+    lights: &Option<lights::Lights>,
     file_mgr: &Option<std::sync::Arc<files::FileManager>>,
     almanach_client: &Option<std::sync::Arc<tokio::sync::Mutex<almanach::AlmanachClient>>>,
     client: &Option<openclaw::OrchestreClient>,
@@ -966,6 +973,24 @@ fn dispatch_command(
         }
     }
     if let Some(brain) = brain {
+        // Direct light control (Nanoleaf): deterministic, fast, no LLM.
+        if let Some(ref lc) = lights {
+            if let Some(cmd) = lights::parse_command(text, &lc.names()) {
+                match rt.block_on(lc.execute(&cmd)) {
+                    Ok(reply) => {
+                        println!("<< {reply}");
+                        if let Err(e) = say_streamed(speaker, &reply, rt, device) {
+                            tracing::error!("speech failed: {e:#}");
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        tracing::warn!("light command failed: {e:#}");
+                        // Fall through to brain — maybe it's about lights.
+                    }
+                }
+            }
+        }
         // Home Assistant commands: deterministic, fast, no LLM needed.
         if let Some(ref home) = home_client {
             if let Some(cmd) = home::parse_command(text) {
@@ -1219,6 +1244,11 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
     } else {
         None
     };
+    let lights = if config.lights.enabled && !config.lights.nanoleaf.is_empty() {
+        Some(lights::Lights::new(&config.lights))
+    } else {
+        None
+    };
     let file_mgr = if config.files.enabled {
         Some(std::sync::Arc::new(files::FileManager::new(&config.files)?))
     } else {
@@ -1360,6 +1390,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                         &coding_active,
                         &brain,
                         &home_client,
+                        &lights,
                         &file_mgr,
                         &almanach_client,
                         &client,
@@ -1474,6 +1505,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                             &coding_active,
                             &brain,
                             &home_client,
+                            &lights,
                             &file_mgr,
                             &almanach_client,
                             &client,
@@ -1517,6 +1549,7 @@ fn listen_loop(config: AppConfig, bridge: Option<PathBuf>) -> anyhow::Result<()>
                                 &coding_active,
                                 &brain,
                                 &home_client,
+                                &lights,
                                 &file_mgr,
                                 &almanach_client,
                                 &client,
@@ -1627,6 +1660,20 @@ async fn main() -> anyhow::Result<()> {
             for name in voice::output_devices() {
                 println!("{name}");
             }
+        }
+        Some(Command::PairNanoleaf { name }) => {
+            let config = load_config(&cli.config)?;
+            init_tracing(&config.logging.level);
+            let ncfg = config
+                .lights
+                .nanoleaf
+                .get(&name)
+                .with_context(|| format!("no lights.nanoleaf entry named '{name}' in the config"))?;
+            println!("Pairing with {} ({})...", name, ncfg.host);
+            println!("Put the controller in pairing mode NOW (hold power 5-7s, or Nanoleaf app -> Connect to API).");
+            let token = lights::NanoleafClient::pair(&ncfg.host, config.lights.timeout_sec).await?;
+            std::fs::write(&ncfg.token_file, format!("{token}\n"))?;
+            println!("Token saved to {}", ncfg.token_file.display());
         }
         Some(Command::Speak { text }) => {
             let config = load_config(&cli.config)?;

@@ -103,6 +103,17 @@ coding:
       persona: "tutor"
       local_model: "google/gemma-4-e4b"
 
+# Direct light control (no Home Assistant). Pair once with:
+#   five-daemon pair-nanoleaf desk
+# while the controller is in pairing mode (hold power 5-7s, or Nanoleaf
+# app -> device settings -> Connect to API).
+#lights:
+#  enabled: true
+#  nanoleaf:
+#    desk:
+#      host: "192.168.1.50"
+#      token_file: "nanoleaf-desk-token.txt"   # git-ignored, written by pairing
+
 # Smart home control via Home Assistant. Uncomment and fill in your HA URL
 # and token to enable voice light/scene control.
 #home:
