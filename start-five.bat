@@ -2,15 +2,12 @@
 setlocal EnableDelayedExpansion
 
 title Five — Voice Assistant
-mode con: cols=80 lines=30
+mode con: cols=100 lines=40
 color 0B
 
 :: ---------------------------------------------------------------------------
 :: Five Startup Script for Windows (Legion Go)
-:: ---------------------------------------------------------------------------
-:: This starts Five in the foreground so you can see logs and stop it with
-:: Ctrl+C. If you want it to run silently in the background as a service,
-:: look at NSSM (Non-Sucking Service Manager) or WinSW.
+:: Quick Start: Double-click this file to start Five with an interactive menu
 :: ---------------------------------------------------------------------------
 
 set "FIVE_DIR=%~dp0"
@@ -18,6 +15,17 @@ set "CONFIG=%FIVE_DIR%config.windows.yaml"
 set "FIVE_EXE=%FIVE_DIR%target\release\five-daemon.exe"
 set "FIVE_DEBUG=%FIVE_DIR%target\debug\five-daemon.exe"
 set "KIMI_KEY=%FIVE_DIR%kimi-key.txt"
+
+:: Check if running from correct directory
+if not exist "%FIVE_DIR%Cargo.toml" (
+    echo [ERROR] This script must be run from the Five project directory.
+    echo        Current directory: %CD%
+    echo        Script directory: %FIVE_DIR%
+    echo.
+    echo Please navigate to the Five project folder and run again.
+    pause
+    exit /b 1
+)
 
 echo.
 echo    ╔══════════════════════════════════════════════════════════════════════╗
@@ -36,9 +44,16 @@ if %ERRORLEVEL% == 0 (
     echo [WARN] five-daemon.exe is ALREADY RUNNING.
     echo        Check Task Manager or run: taskkill /IM five-daemon.exe /F
     echo.
-    echo        Press any key to exit.
-    pause >nul
-    exit /b 1
+    set /p RESTART="Do you want to kill it and restart? (Y/N): "
+    if /i "%RESTART%"=="Y" (
+        echo Killing five-daemon.exe...
+        taskkill /IM five-daemon.exe /F
+        timeout /t 2 /nobreak >nul
+    ) else (
+        echo Press any key to exit.
+        pause >nul
+        exit /b 1
+    )
 )
 
 :: ---------------------------------------------------------------------------
@@ -56,11 +71,29 @@ if exist "%FIVE_EXE%" (
     echo      Tried: target\release\five-daemon.exe
     echo            target\debug\five-daemon.exe
     echo.
-    echo      Build it first:
-    echo        cargo build --release
+    echo      Build it first with one of these commands:
+    echo        cargo build --release    ^(recommended^)
+    echo        cargo build              ^(debug mode^)
     echo.
-    pause
-    exit /b 1
+    echo      Or run the build script: .\build-five.bat
+    echo.
+    set /p BUILD="Do you want to build now? (Y/N): "
+    if /i "%BUILD%"=="Y" (
+        call :BUILD_RELEASE
+    ) else (
+        pause
+        exit /b 1
+    )
+    REM Re-check after build
+    if exist "%FIVE_EXE%" (
+        set "FIVE_BIN=%FIVE_EXE%"
+    ) else if exist "%FIVE_DEBUG%" (
+        set "FIVE_BIN=%FIVE_DEBUG%"
+    ) else (
+        echo [ERROR] Build failed - executable still not found.
+        pause
+        exit /b 1
+    )
 )
 
 :: ---------------------------------------------------------------------------
@@ -70,6 +103,18 @@ if exist "%CONFIG%" (
     echo [OK] Config found: config.windows.yaml
 ) else (
     echo [!!] config.windows.yaml not found in %FIVE_DIR%
+    echo.
+    if exist "%FIVE_DIR%config.example.yaml" (
+        set /p COPY="Copy config.example.yaml to config.windows.yaml? (Y/N): "
+        if /i "%COPY%"=="Y" (
+            copy "%FIVE_DIR%config.example.yaml" "%CONFIG%" >nul
+            echo [OK] Copied config.example.yaml to config.windows.yaml
+            echo      Please edit config.windows.yaml with your settings.
+            pause
+            exit /b 1
+        )
+    )
+    echo      Create a config file or copy from config.example.yaml
     pause
     exit /b 1
 )
@@ -78,10 +123,12 @@ if exist "%CONFIG%" (
 :: 3. Check model files
 :: ---------------------------------------------------------------------------
 set "MODEL_OK=1"
+set "MISSING_MODELS="
 
 if not exist "%FIVE_DIR%models\ggml-tiny.en.bin" (
     echo [!!] Missing: models\ggml-tiny.en.bin  (Whisper STT model)
     set "MODEL_OK=0"
+    set "MISSING_MODELS=%MISSING_MODELS% ggml-tiny.en.bin"
 ) else (
     echo [OK] Whisper model found
 )
@@ -89,6 +136,7 @@ if not exist "%FIVE_DIR%models\ggml-tiny.en.bin" (
 if not exist "%FIVE_DIR%models\kokoro\model.onnx" (
     echo [!!] Missing: models\kokoro\model.onnx  (Kokoro TTS model)
     set "MODEL_OK=0"
+    set "MISSING_MODELS=%MISSING_MODELS% kokoro/model.onnx"
 ) else (
     echo [OK] Kokoro TTS model found
 )
@@ -96,17 +144,27 @@ if not exist "%FIVE_DIR%models\kokoro\model.onnx" (
 if not exist "%FIVE_DIR%models\kokoro\voices.bin" (
     echo [!!] Missing: models\kokoro\voices.bin  (Kokoro voices)
     set "MODEL_OK=0"
+    set "MISSING_MODELS=%MISSING_MODELS% kokoro/voices.bin"
 ) else (
     echo [OK] Kokoro voices found
 )
 
 if "%MODEL_OK%"=="0" (
     echo.
-    echo      Download models or check your models\ directory.
-    echo      See README for setup instructions.
+    echo      Missing model files:%MISSING_MODELS%
     echo.
-    pause
-    exit /b 1
+    echo      Download models from:
+    echo        - Whisper: https://huggingface.co/ggerganov/whisper.cpp
+    echo        - Kokoro:  https://github.com/thewh1teagle/kokoro-onnx
+    echo.
+    echo      Or run: mkdir models && cd models
+    echo            curl -L -o ggml-tiny.en.bin ^<whisper-url^>
+    echo.
+    set /p CONTINUE="Continue anyway? (models will fail when used) (Y/N): "
+    if /i not "%CONTINUE%"=="Y" (
+        pause
+        exit /b 1
+    )
 )
 
 :: ---------------------------------------------------------------------------
@@ -264,6 +322,44 @@ echo.
 pause
 del diagnose.wav 2>nul
 goto :END
+
+:: ---------------------------------------------------------------------------
+:: BUILD_RELEASE — Build the release version
+:: ---------------------------------------------------------------------------
+:BUILD_RELEASE
+echo.
+echo    ╔══════════════════════════════════════════════════════════════════════╗
+echo    ║  Building Five (release mode)...                                     ║
+echo    ║  This may take several minutes on first build.                       ║
+echo    ╚══════════════════════════════════════════════════════════════════════╝
+echo.
+
+:: Check for cargo
+where cargo >nul 2>&1
+if %ERRORLEVEL% NEQ 0 (
+    echo [ERROR] cargo not found. Please install Rust from https://rustup.rs/
+    pause
+    exit /b 1
+)
+
+echo [..] Running: cargo build --release
+cargo build --release
+if %ERRORLEVEL% NEQ 0 (
+    echo.
+    echo [ERROR] Build failed. See errors above.
+    echo         Common issues:
+    echo         - Missing Visual Studio Build Tools with C++ support
+    echo         - Missing cmake: choco install cmake
+    echo         - Path too long - try building in a shorter path
+    echo.
+    pause
+    exit /b 1
+)
+echo.
+echo [OK] Build completed successfully!
+echo.
+timeout /t 2 /nobreak >nul
+goto :EOF
 
 :: ---------------------------------------------------------------------------
 :: END
