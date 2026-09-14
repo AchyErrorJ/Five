@@ -1,24 +1,55 @@
-/target
+```
+# Scripts and executables
+*.bat
+*.sh
+
+# Logs and temporary files
 *.log
-config.local.yaml
+*.tmp
+*.temp
 
-# Downloaded model artifacts (fetch per-machine, see HANDOFF.md §8)
-/models/
-/voices/
-config.dev.yaml
+# Environment files
+.env
+.env.local
+*.env.*
 
-kimi-key.txt
+# Editor/IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
 
-# Local test/debug artifacts
-*.wav
-listen*.txt
-listen.pid
-err.txt
-t?.txt
-eval-debug*.txt
-/tmp-eval/
-bridge.txt
-notebook.md
-latency-report.html
-claude-bridge.txt
-nanoleaf-*-token.txt
+# Build artifacts
+build/
+dist/
+target/
+
+# Dependencies
+node_modules/
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Coverage reports
+coverage/
+htmlcov/
+.coverage
+
+# Compression files
+*.zip
+*.gz
+*.tar
+*.tgz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.zst
+```
