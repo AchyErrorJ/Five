@@ -2,8 +2,9 @@
 setlocal EnableDelayedExpansion
 
 title Five — Voice Assistant
-mode con: cols=100 lines=40
 color 0B
+:: Only try to resize if we're in a real console
+mode con: cols=100 lines=40 2>nul || echo [INFO] Running in non-console mode
 
 :: ---------------------------------------------------------------------------
 :: Five Startup Script for Windows (Legion Go)
