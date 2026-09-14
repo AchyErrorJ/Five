@@ -53,7 +53,7 @@ logging:
 # and escalates hard/coding tasks to Kimi (Moonshot).
 brain:
   enabled: true
-  local_url: "http://127.0.0.1:1234/v1"
+  local_url: "http://169.254.83.107:1234/v1"
   local_model: "google/gemma-4-e4b"
   # Output token budget per reply (spoken replies stay small).
   max_tokens: 512
