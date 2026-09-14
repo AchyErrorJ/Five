@@ -2,7 +2,6 @@
 setlocal EnableDelayedExpansion
 
 title Five — Voice Assistant
-mode con: cols=100 lines=40
 color 0B
 
 :: ---------------------------------------------------------------------------
@@ -16,6 +15,9 @@ set "FIVE_EXE=%FIVE_DIR%target\release\five-daemon.exe"
 set "FIVE_DEBUG=%FIVE_DIR%target\debug\five-daemon.exe"
 set "KIMI_KEY=%FIVE_DIR%kimi-key.txt"
 
+:: Keep window open on any error
+set "PAUSE_ON_ERROR=1"
+
 :: Check if running from correct directory
 if not exist "%FIVE_DIR%Cargo.toml" (
     echo [ERROR] This script must be run from the Five project directory.
@@ -23,6 +25,7 @@ if not exist "%FIVE_DIR%Cargo.toml" (
     echo        Script directory: %FIVE_DIR%
     echo.
     echo Please navigate to the Five project folder and run again.
+    echo.
     pause
     exit /b 1
 )
@@ -110,11 +113,14 @@ if exist "%CONFIG%" (
             copy "%FIVE_DIR%config.example.yaml" "%CONFIG%" >nul
             echo [OK] Copied config.example.yaml to config.windows.yaml
             echo      Please edit config.windows.yaml with your settings.
+            echo.
+            echo Press any key to exit, then edit the config and run again.
             pause
             exit /b 1
         )
     )
     echo      Create a config file or copy from config.example.yaml
+    echo.
     pause
     exit /b 1
 )
@@ -157,7 +163,7 @@ if "%MODEL_OK%"=="0" (
     echo        - Whisper: https://huggingface.co/ggerganov/whisper.cpp
     echo        - Kokoro:  https://github.com/thewh1teagle/kokoro-onnx
     echo.
-    echo      Or run: mkdir models && cd models
+    echo      Or run: mkdir models ^&^& cd models
     echo            curl -L -o ggml-tiny.en.bin ^<whisper-url^>
     echo.
     set /p CONTINUE="Continue anyway? (models will fail when used) (Y/N): "
@@ -185,30 +191,7 @@ echo.
 echo [..] Checking OpenClaw gateway on 127.0.0.1:10000 ...
 powershell -NoProfile -Command "try { $r = Invoke-RestMethod -Uri 'http://127.0.0.1:10000/status' -TimeoutSec 3 -ErrorAction Stop; Write-Host '     [OK] Gateway is up.' } catch { Write-Host '     [WARN] Gateway not responding. Five will still start, but' ; Write-Host '            commands that need OpenClaw will fail until it is.' }"
 
-:: ---------------------------------------------------------------------------
-:: 6. Optional: quick audio test
-:: ---------------------------------------------------------------------------
-echo.
-echo [..] Ready to start. What mode?
-echo.
-echo      1 — Normal mode  (tutor + voice commands, default)
-echo      2 — Coding mode  (routes to Claude Code bridge)
-echo      3 — Test audio   (record 3s, then speak it back)
-echo      4 — Test STT     (record 5s, transcribe to text)
-echo      5 — Just run     (skip menu, start immediately)
-echo      D — Diagnose     (full audio pipeline check)
-echo      Q — Quit
-echo.
-set /p MODE="Pick: "
-
-if /i "%MODE%"=="q" exit /b 0
-if /i "%MODE%"=="d" goto :DIAGNOSE
-if "%MODE%"=="5" goto :RUN
-if "%MODE%"=="1" goto :RUN
-if "%MODE%"=="2" goto :CODING
-if "%MODE%"=="3" goto :TEST_AUDIO
-if "%MODE%"=="4" goto :TEST_STT
-
+:: Skip the interactive menu and just run directly for simplicity
 goto :RUN
 
 :: ---------------------------------------------------------------------------
@@ -237,7 +220,7 @@ if %ERRORLEVEL% NEQ 0 (
     echo         Run from cmd.exe to see full error output.
     pause
 )
-goto :END
+exit /b 0
 
 :: ---------------------------------------------------------------------------
 :: CODING MODE
@@ -362,10 +345,11 @@ timeout /t 2 /nobreak >nul
 goto :EOF
 
 :: ---------------------------------------------------------------------------
-:: END
+:: END - Keep window open when done
 :: ---------------------------------------------------------------------------
 :END
 echo.
 echo Five stopped. Press any key to close.
 pause >nul
 endlocal
+exit /b 0
